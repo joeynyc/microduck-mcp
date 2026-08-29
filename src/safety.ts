@@ -34,8 +34,16 @@ export function clampVelocity(vx: number, vy: number, wz: number) {
   };
 }
 
-/** Throws with an agent-readable reason if motion should not be issued. */
-export async function preMotionCheck(t: DuckTransport): Promise<void> {
+/**
+ * Throws with an agent-readable reason if motion should not be issued.
+ * `allowUnhealthy` is for recovery behaviors (getup): a fallen robot is by
+ * definition unhealthy, and refusing the one command that fixes that would
+ * strand it. Battery floor and rate limit still apply.
+ */
+export async function preMotionCheck(
+  t: DuckTransport,
+  opts: { allowUnhealthy?: boolean } = {},
+): Promise<void> {
   const now = Date.now();
   if (now - lastMotionAt < LIMITS.motionCooldownMs) {
     throw new Error(
@@ -56,7 +64,7 @@ export async function preMotionCheck(t: DuckTransport): Promise<void> {
         `where robotd sits the robot down; this floor keeps margin above it.)`,
     );
   }
-  if (health?.healthy === false) {
+  if (health?.healthy === false && !opts.allowUnhealthy) {
     throw new Error(
       `Robot reports unhealthy (mode: ${health?.mode ?? "unknown"}). ` +
         `Run duck_health for details before commanding motion.`,

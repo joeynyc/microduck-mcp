@@ -8,8 +8,10 @@ make it pick things up, read its health, and stop it.
 
 Part of [MicroduckHub](https://microduckhub.com).
 
-Works today with **no robot** via a built-in mock transport, so you can build
-and test agent workflows before your duck ships.
+Works today with **no robot**: a mock transport for instant canned state, and
+a **simulator** — CPU MuJoCo running Pollen's official pretrained ONNX
+policies — so agents can walk, sit, kick and *look at* a physically simulated
+duck before yours ships.
 
 ## Quick start
 
@@ -19,6 +21,10 @@ npm run build
 
 # Mock duck (default — no hardware needed)
 npm start
+
+# Simulated duck: CPU MuJoCo + official ONNX policies (one-time setup ~1 min)
+sim/setup.sh            # needs uv (https://docs.astral.sh/uv/); vendors ~30 MB of assets
+DUCK_TRANSPORT=sim npm start
 
 # Real duck over ssh
 DUCK_TRANSPORT=ssh DUCK_HOST=duck@microduck.local npm start
@@ -30,8 +36,9 @@ DUCK_TRANSPORT=unix npm start
 ### Try it without a client
 
 ```bash
-npm test      # safety-layer + mock unit tests
-npm run demo  # health → walk → monitor → quack → stop, through a real MCP client
+npm test                         # safety layer, mock, sim-transport contract tests
+npm run demo                     # health → walk → monitor → camera → quack → stop (mock)
+DUCK_TRANSPORT=sim npm run demo  # same, in MuJoCo; frames land in demo-out/
 ```
 
 ### Claude Desktop / Claude Code config
@@ -60,8 +67,9 @@ Or for Claude Code: `claude mcp add microduck -e DUCK_TRANSPORT=mock -- node /pa
 | `duck_version` | Running vs installed software per daemon | read-only |
 | `duck_updates` | Installed releases | read-only |
 | `duck_monitor` | One-shot state: joints, gravity, gyro, odometry, current intent | read-only |
-| `duck_walk` | Velocity intent (vx/vy/wz) | clamped, battery-gated, rate-limited |
-| `duck_behavior` | sit / stand / getup / pickup / kick / quack | gated (quack is free) |
+| `duck_camera` | PNG frame: head camera or follow/front/side/top view (sim today) | read-only |
+| `duck_walk` | Velocity intent (vx/vy/wz) for `duration_s`, then auto-stops | clamped, battery-gated, rate-limited |
+| `duck_behavior` | sit / stand / getup / pickup / kick / roulade / quack | gated (quack is free; getup allowed while fallen) |
 | `duck_stop` | Zero all motion, immediately | **never** gated |
 
 ## Safety
@@ -72,10 +80,28 @@ on top — velocity caps, a 15% battery floor for motion, rate limiting — beca
 an agent-agnostic tool can't assume the calling model is careful. `duck_stop`
 is always available.
 
+## Transports
+
+| `DUCK_TRANSPORT` | What | Needs |
+|---|---|---|
+| `mock` (default) | Canned state, instant | nothing |
+| `sim` | Headless CPU MuJoCo running the official `alpha_*.onnx` policies with robotd's control chain, in a Python sidecar (`sim/duck_sim.py`) | `sim/setup.sh` |
+| `unix` | The robot's own daemons over `/run/*.sock` | running on the duck |
+| `ssh` | `robotctl` over ssh | a duck on the network |
+
+All four sit behind one `DuckTransport` interface, so the tools — and the
+safety layer — are identical whether the duck is simulated or real.
+
+Sim fidelity note: the reference MuJoCo scene under-tracks small velocity
+commands (verified identical to upstream's own `infer_policy.py`). Expect
+~0.08 m/s at the 0.25 m/s cap and weak yaw. It walks, sits, stands, kicks
+and rolls; it just isn't a speed benchmark.
+
 ## Status
 
-Pre-hardware scaffold. RPC method names are inferred from upstream's
-architecture docs and will be verified against the real contract before ducks
-ship (~Dec 2026). See `CLAUDE.md` for the full technical context and roadmap.
+Pre-hardware. The sim path is validated; the `unix`/`ssh` paths still use
+provisional method names that differ from upstream's now-published
+`duck-ipc-proto` (mapping table in `CLAUDE.md`) and will be renamed before
+ducks ship (~Dec 2026).
 
 Apache-2.0-friendly; upstream robot software is Apache 2.0.

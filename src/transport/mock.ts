@@ -1,5 +1,9 @@
 import { DuckService, DuckTransport } from "./types.js";
 
+/** 8×6 duck-yellow PNG, so duck_camera returns a valid image on mock. */
+const MOCK_PNG =
+  "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAGCAIAAABxZ0isAAAAEUlEQVR4nGP4tY0RK2IYSAkA+a9RMS1rAqsAAAAASUVORK5CYII=";
+
 const j = (pos_rad: number, vel_rad_s: number, temp_c: number) => ({
   pos_rad: +pos_rad.toFixed(3),
   vel_rad_s: +vel_rad_s.toFixed(3),
@@ -106,6 +110,15 @@ export class MockTransport implements DuckTransport {
           release: "0.9.3-mock",
           revision: "rev unknown, not a CI build",
           daemons: { robotd: "0.9.3", configd: "0.9.3", updaterd: "0.9.3" },
+          mock: true,
+        };
+      case "sim.camera":
+        return {
+          png_base64: MOCK_PNG,
+          width: 8,
+          height: 6,
+          view: params?.view ?? "follow",
+          note: "mock transport — placeholder frame. Use DUCK_TRANSPORT=sim for a rendered view.",
           mock: true,
         };
       case "update.list":

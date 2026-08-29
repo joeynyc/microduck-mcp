@@ -76,6 +76,16 @@ describe("preMotionCheck", () => {
     await assert.rejects(() => preMotionCheck(t), /unhealthy \(mode: fallen\)/);
   });
 
+  test("allowUnhealthy lets a recovery behavior through a fallen robot", async () => {
+    const t = stub({ ...OK, healthy: false, mode: "fallen" });
+    await preMotionCheck(t, { allowUnhealthy: true });
+  });
+
+  test("allowUnhealthy does not bypass the battery floor", async () => {
+    const t = stub({ healthy: false, mode: "fallen", battery: { fraction: 0.05 } });
+    await assert.rejects(() => preMotionCheck(t, { allowUnhealthy: true }), /Battery/);
+  });
+
   test("battery floor is checked before the healthy flag", async () => {
     const t = stub({ healthy: false, mode: "fallen", battery: { fraction: 0.05 } });
     await assert.rejects(() => preMotionCheck(t), /Battery/);

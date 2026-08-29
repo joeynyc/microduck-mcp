@@ -31,8 +31,10 @@ sessions on this repo.
    Gemini CLI, smolagents (HF's own stack — strategic given the duck is a HF
    product).
 2. **Transport abstraction** (`src/transport/`): `mock` (default, no hardware),
-   `unix` (on-robot), `ssh` (laptop → robotctl over ssh). Selected via
-   `DUCK_TRANSPORT` env. Mock-first because nobody has hardware until ~Dec.
+   `sim` (CPU MuJoCo + the official pretrained ONNX policies, via a Python
+   sidecar), `unix` (on-robot), `ssh` (laptop → robotctl over ssh). Selected
+   via `DUCK_TRANSPORT` env. Mock-first because nobody has hardware until
+   ~Dec; sim is where behaviour gets validated before then.
 3. **Server-side safety layer** (`src/safety.ts`) on top of robotd's own:
    velocity clamps, battery floor (15%) for motion, rate limiting, and a
    `duck_stop` tool that is NEVER gated. Rationale: we can't assume any
@@ -42,13 +44,51 @@ sessions on this repo.
    Hub policy channel ships, because that's when it becomes DuckHub's deploy
    backend (see sibling repo `duckhub`).
 
-## Method names are provisional
+## Method names: ours vs upstream's (verified 2026-08-29)
 
-The exact RPC method names (`robot.intent`, `robot.behavior`, `robot.stop`)
-are inferred from the architecture doc's namespaces, NOT from a published
-schema — the IPC contract is pre-1.0. **Before hardware ships:** diff against
-upstream (their `docs/design/architecture.md` §2 and the robotctl source) and
-correct `src/transport/*.ts` + tool wiring. Track upstream issues/releases.
+Upstream now publishes the contract in `duck-ipc-proto/src/lib.rs` (commit
+590b986). Our internal names predate it and **do not match**. The sim sidecar
+accepts both; `unix`/`ssh` still send ours and must be renamed before hardware:
+
+| ours (transport calls)        | upstream wire method                     | notes |
+|-------------------------------|------------------------------------------|-------|
+| `robot.intent {vx,vy,wz}`     | `robot.move {vx,vy,vyaw}` (notification) | continuous, last-writer-wins, deadman-stamped |
+| `robot.behavior {name}`       | `robot.do {skill}` skill ∈ ground_pick, kick_left, kick_right, sit_toggle, roulade | no `getup`, no `stand`; sit↔stand is one toggle |
+| —                             | `robot.head {neck_pitch,head_pitch,head_yaw,head_roll}` | sim implements it; no tool yet |
+| `robot.stop`                  | `robot.stop`                             | same |
+| `robot.health`                | `robot.health` → `HealthResult`          | `battery:{volts,percent}` — **percent, not fraction**; safety.ts reads `battery.fraction`, so the unix/ssh path needs an adapter |
+| `robot.state` (duck_monitor)  | `robot.state` frame via `robot.subscribe` | upstream is a subscription stream; one-shot = subscribe, take one, close |
+| `update.list`                 | `update.listInstalled`                   | |
+| `system.version`              | `system.info` (+ updaterd `hello`)       | |
+
+Also: `quack` is `robot.sound {tag}`, and bring-up (`robot.enable/init/relax`)
+is not exposed at all yet. Obs layout, control chain and battery mapping are
+ported verbatim in `sim/duck_sim.py` with line-level provenance.
+
+## Sim transport (`DUCK_TRANSPORT=sim`)
+
+- `sim/duck_sim.py` = headless CPU MuJoCo (scene from `microduck_rl`) driving
+  the vendored `pollen-robotics/microduck/policies/*.onnx` with a port of
+  robotd's `control.rs` (action scale 0.9, head/leg low-pass 0.5/0.7, standing
+  net at |twist| ≤ 0.05, skill windows, cmd EMA 0.2, fall → limp). 200 Hz
+  physics × 4 = 50 Hz policy, same as the robot.
+- `sim/setup.sh` makes the venv and vendors both upstream repos at pinned
+  SHAs into `sim/vendor/` (gitignored, ~30 MB). `MUJOCO_GL=egl` is set by the
+  transport; works headless on WSL2.
+- Speaks robotd's wire protocol over stdio, so `SimTransport` is
+  `UnixTransport` with a child process where the socket is. Extra methods:
+  `sim.camera {view,width,height}` → base64 PNG, `sim.reset`.
+- **Known sim fidelity limit:** the reference scene's position actuators
+  under-track small commands. Verified against upstream's own
+  `infer_policy.py` (identical numbers, bit-identical obs): vx 0.2 → ~0
+  m/s, 0.25 → 0.08, 0.4 → 0.16; yaw ~5% of commanded. Not a port bug;
+  don't retune the scene to hide it. Our 0.25 m/s cap walks visibly.
+- No stand-up policy ships, and robotd has no getup skill (fall → limp, a
+  human rights it). In sim, `getup` teleports upright in place. It is the one
+  motion tool allowed through `preMotionCheck` while unhealthy.
+- Prior art: aj-dev-smith/microduck-mcp (Glama "duck-mcp") is sim-only and
+  returns camera frames as file paths. Ours returns an MCP image block and
+  keeps the transport contract so the same tools drive hardware.
 
 ## Transport roadmap
 
@@ -61,12 +101,16 @@ correct `src/transport/*.ts` + tool wiring. Track upstream issues/releases.
 
 ## Roadmap / TODO
 
-- [ ] Verify RPC method names against upstream once schema stabilizes
-- [ ] `duck_camera_snapshot` tool via mediad WebRTC (needs v2 transport work)
+- [x] Verify RPC method names against upstream — done, table above. **Next:**
+      rename in `unix.ts`/`ssh.ts` and adapt `battery.percent` → fraction.
+- [x] `sim` transport: CPU MuJoCo + official ONNX policies (`sim/duck_sim.py`)
+- [x] `duck_camera` tool — sim renders; hardware path via mediad WebRTC still TODO
+- [ ] `duck_head` tool (`robot.head`) — sim already handles it
 - [ ] `duck_depth` tool — tofd's 8×8 matrix via `tof.stream` subscription
 - [x] `duck_monitor` — one-shot state sample (joints, gravity, odometry) — mock `robot.state`; method name provisional like the rest
 - [x] Tests: safety layer unit tests (`npm test`, node:test on dist)
-- [ ] Tests: transport contract tests (unix/ssh against a fake JSON-RPC socket)
+- [x] Tests: sim transport contract tests (fake stdio sidecar, no MuJoCo)
+- [ ] Tests: unix/ssh contract tests against a fake JSON-RPC socket
 - [ ] Publish: npm + MCP registries/directories once validated on hardware
 - [ ] Integration guide per client (Claude Desktop config, Cursor, smolagents)
 
@@ -74,7 +118,11 @@ correct `src/transport/*.ts` + tool wiring. Track upstream issues/releases.
 
 - `npm test` — builds then runs `node --test` over `dist/**/*.test.js`.
 - `npm run demo` — `scripts/demo.mjs` drives the server through the MCP SDK
-  client in mock mode (the "health, walk, quack" conversation, scripted).
+  client (the "health, walk, quack" conversation, scripted). With
+  `DUCK_TRANSPORT=sim` it also grabs camera frames into `demo-out/`.
+- `sim/setup.sh` once, then `DUCK_TRANSPORT=sim npm start`. Sidecar tuning
+  via `DUCK_SIM_BATTERY_V` (test the battery floor), `DUCK_SIM_DEADMAN_S`,
+  `DUCK_SIM_ARGS="--no-realtime"`.
 - Tests use `resetMotionCooldown()` from `src/safety.ts` to clear module
   state between cases; never call it from a tool.
 
@@ -82,5 +130,6 @@ correct `src/transport/*.ts` + tool wiring. Track upstream issues/releases.
 
 - TypeScript strict, ESM, Node16 module resolution. `npm run build` must pass.
 - Every motion tool goes through `preMotionCheck`. No exceptions except
-  `duck_stop` and `quack`.
+  `duck_stop` and `quack`; `getup` passes `allowUnhealthy` (battery + rate
+  limit still apply).
 - Tool descriptions state their safety behavior explicitly (agents read them).
