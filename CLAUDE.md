@@ -1,8 +1,9 @@
-# microduckhub-mcp — agent context
+# microduck-mcp — agent context
 
 Agent-agnostic MCP server for the Pollen Robotics Microduck (~25cm, 800g biped,
-$399, ships ~Christmas 2026). Lives under the MicroduckHub brand
-(microduckhub.com); npm package + GitHub repo are `microduckhub-mcp`. This file is the working context for AI coding
+$399, ships ~Christmas 2026). Published under the MicroduckHub brand
+(microduckhub.com) but named for what it is: repo + npm are `microduck-mcp`.
+Decided 2026-08-29 — brand is the umbrella, product is named for search. This file is the working context for AI coding
 sessions on this repo.
 
 ## The robot's actual architecture (verified against upstream docs, Aug 2026)

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * microduckhub-mcp — a Model Context Protocol server for the Pollen Robotics
+ * microduck-mcp — a Model Context Protocol server for the Pollen Robotics
  * Microduck. Agent-agnostic: works with any MCP client (Claude, ChatGPT,
  * Cursor, Gemini CLI, smolagents, ...). Transport is selected by env:
  *
@@ -32,7 +32,7 @@ function pickTransport(): DuckTransport {
 }
 
 const duck = pickTransport();
-const server = new McpServer({ name: "microduckhub-mcp", version: "0.1.0" });
+const server = new McpServer({ name: "microduck-mcp", version: "0.1.0" });
 
 const json = (v: unknown) => ({
   content: [{ type: "text" as const, text: JSON.stringify(v, null, 2) }],
@@ -204,7 +204,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
-    `microduckhub-mcp up (transport: ${process.env.DUCK_TRANSPORT ?? "mock"})`,
+    `microduck-mcp up (transport: ${process.env.DUCK_TRANSPORT ?? "mock"})`,
   );
 }
 

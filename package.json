@@ -1,7 +1,7 @@
 {
-  "name": "microduckhub-mcp",
+  "name": "microduck-mcp",
   "version": "0.1.0",
-  "description": "Agent-agnostic MCP server for the Pollen Robotics Microduck",
+  "description": "Agent-agnostic MCP server for the Pollen Robotics Microduck \u2014 by MicroduckHub",
   "main": "index.js",
   "scripts": {
     "build": "tsc",
@@ -30,11 +30,11 @@
   },
   "type": "module",
   "bin": {
-    "microduckhub-mcp": "dist/index.js"
+    "microduck-mcp": "dist/index.js"
   },
   "homepage": "https://microduckhub.com",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/joeynyc/microduckhub-mcp.git"
+    "url": "git+https://github.com/joeynyc/microduck-mcp.git"
   }
 }
