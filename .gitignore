@@ -3,3 +3,4 @@ dist/
 sim/.venv/
 sim/vendor/
 demo-out/
+__pycache__/
