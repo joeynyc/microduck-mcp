@@ -1,10 +1,12 @@
-# microduck-mcp 🦆
+# microduckhub-mcp 🦆
 
 **The universal agent interface for the [Pollen Robotics Microduck](https://github.com/pollen-robotics/microduck).**
 
 An MCP (Model Context Protocol) server that lets *any* AI agent — Claude,
 ChatGPT, Cursor, Gemini CLI, smolagents — drive a Microduck: walk it, sit it,
 make it pick things up, read its health, and stop it.
+
+Part of [MicroduckHub](https://microduckhub.com).
 
 Works today with **no robot** via a built-in mock transport, so you can build
 and test agent workflows before your duck ships.
@@ -39,7 +41,7 @@ npm run demo  # health → walk → monitor → quack → stop, through a real M
   "mcpServers": {
     "microduck": {
       "command": "node",
-      "args": ["/path/to/microduck-mcp/dist/index.js"],
+      "args": ["/path/to/microduckhub-mcp/dist/index.js"],
       "env": { "DUCK_TRANSPORT": "mock" }
     }
   }
@@ -47,7 +49,7 @@ npm run demo  # health → walk → monitor → quack → stop, through a real M
 ```
 
 If Claude Desktop runs on Windows and this repo lives in WSL, use
-`"command": "wsl.exe", "args": ["-e", "/abs/path/to/node", "/home/you/microduck-mcp/dist/index.js"]`.
+`"command": "wsl.exe", "args": ["-e", "/abs/path/to/node", "/home/you/microduckhub-mcp/dist/index.js"]`.
 Or for Claude Code: `claude mcp add microduck -e DUCK_TRANSPORT=mock -- node /path/to/dist/index.js`.
 
 ## Tools

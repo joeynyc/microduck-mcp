@@ -1,5 +1,5 @@
 {
-  "name": "microduck-mcp",
+  "name": "microduckhub-mcp",
   "version": "0.1.0",
   "description": "Agent-agnostic MCP server for the Pollen Robotics Microduck",
   "main": "index.js",
@@ -10,7 +10,14 @@
     "test": "tsc && node --test \"dist/**/*.test.js\"",
     "demo": "tsc && node scripts/demo.mjs"
   },
-  "keywords": [],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "microduck",
+    "pollen-robotics",
+    "robot",
+    "microduckhub"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
@@ -23,6 +30,11 @@
   },
   "type": "module",
   "bin": {
-    "microduck-mcp": "dist/index.js"
+    "microduckhub-mcp": "dist/index.js"
+  },
+  "homepage": "https://microduckhub.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/joeynyc/microduckhub-mcp.git"
   }
 }
