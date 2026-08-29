@@ -1,0 +1,28 @@
+{
+  "name": "microduck-mcp",
+  "version": "0.1.0",
+  "description": "Agent-agnostic MCP server for the Pollen Robotics Microduck",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js",
+    "test": "tsc && node --test \"dist/**/*.test.js\"",
+    "demo": "tsc && node scripts/demo.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "typescript": "^7.0.2"
+  },
+  "type": "module",
+  "bin": {
+    "microduck-mcp": "dist/index.js"
+  }
+}
