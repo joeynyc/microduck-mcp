@@ -40,7 +40,7 @@ sessions on this repo.
    `duck_stop` tool that is NEVER gated. Rationale: we can't assume any
    calling agent is careful, and this moves physical hardware.
 4. **Deliberately excluded (for now):** `update.apply` / rollback as tools.
-   An agent auto-updating robot firmware is a footgun; revisit once the M2
+   An agent auto-updating robot firmware is a footgun; revisit once the M8
    Hub policy channel ships, because that's when it becomes DuckHub's deploy
    backend (see sibling repo `duckhub`).
 
