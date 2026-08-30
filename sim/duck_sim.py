@@ -24,7 +24,7 @@ pose, 1.75 A current limit) follows `microduck_rl/scripts/infer_policy.py`
 1.0 and no low-pass — robotd wins: it is what the real robot runs, and
 CLAUDE.md says the doc that owns the mechanism wins.
 
-Methods: see `METHODS` at the bottom.
+Methods: upstream's names (duck-ipc-proto), see `METHODS` at the bottom.
 """
 from __future__ import annotations
 
@@ -385,8 +385,7 @@ class DuckSim:
             "healthy": healthy,
             "degraded": False,
             "mode": self.mode,
-            # volts + percent is upstream's Battery; fraction is what safety.ts reads.
-            "battery": {"volts": round(self.battery_v, 2), "percent": round(pct, 1), "fraction": round(pct / 100, 3)},
+            "battery": {"volts": round(self.battery_v, 2), "percent": round(pct, 1)},  # upstream Battery
             "control_loop": {"hz": round(self.hz_est, 1), "missed": self.missed},
             "loop_hz": round(self.hz_est, 1),
             "policy": self.label,
@@ -394,7 +393,7 @@ class DuckSim:
             "sim": True,
         }
         if self.fallen:
-            out["reason"] = "fallen: torque off (limp). Run behavior 'getup' (sim: teleport upright) or sim.reset."
+            out["reason"] = "fallen: torque off (limp). robot.init (behavior 'getup') sets it upright in sim."
         elif not healthy:
             out["reason"] = f"control loop at {self.hz_est:.1f} Hz"
         return out
@@ -414,14 +413,14 @@ class DuckSim:
                        for i, n in enumerate(JOINT_NAMES)},
             "targets": rounded(self.data.ctrl, 4),
             "odometry": self.odom(),
-            "intent": {"vx": vx, "vy": vy, "wz": wz},
+            "intent": {"vx": vx, "vy": vy, "vyaw": wz},
             "safety": {"fallen": self.fallen, "limp": self.fallen, "busy": self.busy()},
             "loop": {"hz": round(self.hz_est, 1), "missed": self.missed},
             "sim": True,
         }
 
     def intent(self, p: dict) -> dict:
-        req = np.array([float(p.get("vx", 0.0)), float(p.get("vy", 0.0)), float(p.get("wz", p.get("vyaw", 0.0)))])
+        req = np.array([float(p.get("vx", 0.0)), float(p.get("vy", 0.0)), float(p.get("vyaw", 0.0))])
         if not np.all(np.isfinite(req)):
             raise RpcError(-32602, "non-finite velocity refused")
         self.require_upright()
@@ -431,8 +430,9 @@ class DuckSim:
         self.limited_by = ["max_velocity"] if np.any(clamped != req) else []
         self.intent_at = self.now()
         self.intent_ttl = float(p.get("ttl_s", self.deadman_s))
-        vx, vy, wz = (float(x) for x in clamped)
-        return {"applied": {"vx": vx, "vy": vy, "wz": wz}, "clamped": bool(self.limited_by),
+        vx, vy, vyaw = (float(x) for x in clamped)
+        # IntentResult, plus what the sidecar applied (upstream reports that on the state frame).
+        return {"accepted": True, "applied": {"vx": vx, "vy": vy, "vyaw": vyaw},
                 "limited_by": self.limited_by, "ttl_s": self.intent_ttl, "sim": True}
 
     def head_cmd(self, p: dict) -> dict:
@@ -441,64 +441,69 @@ class DuckSim:
                 self.head_target[i] = float(p[k])
         return {"head": [float(x) for x in self.head_target], "sim": True}
 
-    def behavior(self, p: dict) -> dict:
-        name = str(p.get("name") or p.get("skill") or "")
-        started, note = True, None
-        if name == "quack":
-            note = "no speaker in sim"
-        elif name == "getup":
-            # No stand-up policy in the vendored set and robotd has no getup skill
-            # (fall → limp, a human picks it up). Sim stands in for the human.
-            xy = self.data.xpos[self.trunk][:2].copy()
-            self.reset()
-            self.data.qpos[self.free_adr:self.free_adr + 2] = xy
-            self.mujoco.mj_forward(self.model, self.data)
-            note = "sim: teleported upright in place"
-        else:
-            self.require_upright()
-            if name in ("sit", "stand", "sit_toggle"):
-                self.net("sitstand")
-                if name == "sit" and self.sit == "sitting":
-                    started, note = False, "already sitting"
-                elif name == "stand" and self.sit == "up":
-                    started, note = False, "already standing"
-                elif self.sit == "rising":
-                    raise RpcError(-32000, "already standing up")
-                elif self.sit == "up":
-                    self.sit = "sitting"
-                    self.target_twist[:] = 0.0
-                else:
-                    self.sit, self.rise_left = "rising", RISE_SECS
-            elif name in ("pickup", "ground_pick"):
-                self.net("ground_pick")
-                if self.ground_pick is not None:
-                    raise RpcError(-32000, "ground pick already running")
-                self.ground_pick = 0.0
-            elif name in ("kick", "kick_right", "kick_left"):
-                left = name == "kick_left"
-                self.net("kick_left" if left else "kick_right")
-                if self.busy():
-                    raise RpcError(-32000, "a scripted move is already running")
-                self.kick = (left, KICK_DURATION)
-                note = "kick is ball-blind; no ball in this scene"
-            elif name == "roulade":
-                self.net("roulade")
-                if self.ground_pick is not None:
-                    raise RpcError(-32000, "a ground pick is running")
-                self.roulade = ROULADE_DURATION
+    def do(self, p: dict) -> dict:
+        """robot.do {skill}: one-shot skills + the sit↔stand toggle (control.rs)."""
+        skill = str(p.get("skill", ""))
+        self.require_upright()
+        note = None
+        if skill == "sit_toggle":
+            self.net("sitstand")
+            if self.sit == "rising":
+                raise RpcError(-32000, "already standing up")
+            if self.sit == "up":
+                self.sit = "sitting"
+                self.target_twist[:] = 0.0
+                note = "sit"
             else:
-                raise RpcError(-32602, f"unknown behavior {name!r}")
-        out = {"behavior": name, "started": started, "sim": True}
+                self.sit, self.rise_left = "rising", RISE_SECS
+                note = "stand"
+        elif skill == "ground_pick":
+            self.net("ground_pick")
+            if self.ground_pick is not None:
+                raise RpcError(-32000, "ground pick already running")
+            self.ground_pick = 0.0
+        elif skill in ("kick_left", "kick_right"):
+            self.net(skill)
+            if self.busy():
+                raise RpcError(-32000, "a scripted move is already running")
+            self.kick = (skill == "kick_left", KICK_DURATION)
+            note = "kick is ball-blind; no ball in this scene"
+        elif skill == "roulade":
+            self.net("roulade")
+            if self.ground_pick is not None:
+                raise RpcError(-32000, "a ground pick is running")
+            self.roulade = ROULADE_DURATION
+        else:
+            raise RpcError(-32602, f"unknown skill {skill!r}")
+        out = {"accepted": True, "skill": skill, "sim": True}
         if note:
             out["note"] = note
         return out
+
+    def init(self, _p: dict) -> dict:
+        """robot.init: power the joints and ramp to the home pose. robotd has no
+        stand-up skill (fall → limp, a human rights it); the sim stands in for
+        the human and sets the duck upright where it is."""
+        xy = self.data.xpos[self.trunk][:2].copy()
+        self.reset()
+        self.data.qpos[self.free_adr:self.free_adr + 2] = xy
+        self.mujoco.mj_forward(self.model, self.data)
+        return {"accepted": True, "note": "sim: set upright in place", "sim": True}
+
+    def sound(self, p: dict) -> dict:
+        return {"accepted": True, "tag": p.get("tag"), "note": "no speaker in sim", "sim": True}
+
+    def subscribe(self, p: dict) -> dict:
+        # SubscribeResult. The sidecar does not stream (one stdout for every
+        # caller); robot.state is answered one-shot instead.
+        return {"accepted": True, **{k: POLICY_FILES[k] for k in self.nets}, "sim": True}
 
     def stop(self, _p: dict) -> dict:
         self.target_twist[:] = 0.0
         self.requested[:] = 0.0
         self.intent_at = -1e9
         self.kick = self.roulade = self.ground_pick = None
-        return {"stopped": True, "sim": True}
+        return {"accepted": True, "sim": True}
 
     def sim_reset(self, _p: dict) -> dict:
         self.reset()
@@ -558,30 +563,29 @@ class DuckSim:
         return {"png_base64": base64.b64encode(buf.getvalue()).decode("ascii"),
                 "width": w, "height": h, "view": view, "t": round(self.now(), 3), "sim": True}
 
-    def version(self, _p: dict) -> dict:
-        return {"release": "sim", "daemons": {"robotd": "duck_sim.py"}, "policies": sorted(self.nets), "sim": True}
+    def system_info(self, _p: dict) -> dict:
+        return {"name": "simduck", "serial": None, "uptime_seconds": int(self.now()), "sim": True}
 
-    def updates(self, _p: dict) -> dict:
-        return {"current": "sim", "installed": ["sim"], "sim": True}
+    def list_installed(self, p: dict) -> dict:
+        return [{"version": "0.0.0-sim", "active": True, "golden": True, "component": p.get("component", "daemon")}]
 
 
-# Wire methods → handlers. `robot.intent` / `robot.behavior` are this repo's
-# provisional names; `robot.move` / `robot.do` are upstream's (CLAUDE.md
-# mapping table). Delete the provisional aliases once unix.ts/ssh.ts send
-# upstream's names.
+# Wire methods → handlers. Names are upstream's (duck-ipc-proto/src/lib.rs);
+# `robot.state` as a *request* and `sim.*` are sidecar extensions.
 METHODS = {
     "robot.health": DuckSim.health,
+    "robot.subscribe": DuckSim.subscribe,
     "robot.state": DuckSim.state,
-    "robot.intent": DuckSim.intent,
     "robot.move": DuckSim.intent,
-    "robot.behavior": DuckSim.behavior,
-    "robot.do": DuckSim.behavior,
     "robot.head": DuckSim.head_cmd,
     "robot.stop": DuckSim.stop,
+    "robot.init": DuckSim.init,
+    "robot.do": DuckSim.do,
+    "robot.sound": DuckSim.sound,
+    "system.info": DuckSim.system_info,
+    "update.listInstalled": DuckSim.list_installed,
     "sim.camera": DuckSim.camera,
     "sim.reset": DuckSim.sim_reset,
-    "system.version": DuckSim.version,
-    "update.list": DuckSim.updates,
 }
 
 

@@ -5,9 +5,13 @@
  * sockets (/run/robotd.sock, /run/configd.sock, /run/updaterd.sock).
  * This MCP server may run:
  *   - on the robot itself  -> UnixTransport (direct socket)
- *   - on a laptop           -> SshTransport (socket forwarded over ssh)
+ *   - on a laptop           -> SshTransport (sockets forwarded over ssh)
+ *   - against a simulator   -> SimTransport (CPU MuJoCo sidecar, same protocol)
  *   - with no robot at all  -> MockTransport (canned responses for dev)
+ *
+ * Method names are upstream's — see ./protocol.ts.
  */
+import { M, RobotState } from "./protocol.js";
 
 export type DuckService = "robotd" | "configd" | "updaterd";
 
@@ -25,6 +29,13 @@ export interface JsonRpcResponse {
   error?: { code: number; message: string; data?: unknown };
 }
 
+/** Server → client, no id (robot.state frames, sim.ready, ...). */
+export interface JsonRpcNotification {
+  jsonrpc: "2.0";
+  method: string;
+  params?: Record<string, unknown>;
+}
+
 export interface SnapshotRequest {
   view: "head" | "follow" | "front" | "side" | "top";
   width: number;
@@ -40,12 +51,18 @@ export interface Snapshot {
 }
 
 export interface DuckTransport {
-  /** Send one JSON-RPC call to the daemon that owns the method's namespace. */
+  /** Send one JSON-RPC request to the daemon that owns the method's namespace. */
   call(
     service: DuckService,
     method: string,
     params?: Record<string, unknown>,
   ): Promise<unknown>;
+  /**
+   * One robot.state frame. Upstream publishes state only as a subscription
+   * stream, so "one sample" is a transport concern: the socket transports
+   * subscribe and take the first frame; the sidecar and mock answer directly.
+   */
+  state(): Promise<RobotState>;
   /**
    * A still frame, if this transport can produce one. Not a robotd RPC — on
    * hardware it will come from mediad's WebRTC stream, in sim from the
@@ -58,10 +75,18 @@ export interface DuckTransport {
   close(): Promise<void>;
 }
 
+/** Route a method namespace to the daemon that owns it (per architecture.md). */
+export function serviceFor(method: string): DuckService {
+  if (method.startsWith("robot.")) return "robotd";
+  if (method.startsWith("update.")) return "updaterd";
+  // net.*, pad.*, system.* live on configd
+  return "configd";
+}
+
 /** The health probe every transport uses for `ping()`. */
 export async function pingViaHealth(t: Pick<DuckTransport, "call">): Promise<boolean> {
   try {
-    await t.call("robotd", "robot.health");
+    await t.call("robotd", M.robotHealth);
     return true;
   } catch {
     return false;
@@ -71,12 +96,4 @@ export async function pingViaHealth(t: Pick<DuckTransport, "call">): Promise<boo
 /** One spelling for a JSON-RPC error, whichever transport carried it. */
 export function rpcErrorMessage(e: NonNullable<JsonRpcResponse["error"]>): string {
   return `${e.message} (code ${e.code})`;
-}
-
-/** Route a method namespace to the daemon that owns it (per architecture.md). */
-export function serviceFor(method: string): DuckService {
-  if (method.startsWith("robot.")) return "robotd";
-  if (method.startsWith("update.")) return "updaterd";
-  // net.*, pad.*, system.* live on configd
-  return "configd";
 }

@@ -32,8 +32,8 @@ sessions on this repo.
    product).
 2. **Transport abstraction** (`src/transport/`): `mock` (default, no hardware),
    `sim` (CPU MuJoCo + the official pretrained ONNX policies, via a Python
-   sidecar), `unix` (on-robot), `ssh` (laptop → robotctl over ssh). Selected
-   via `DUCK_TRANSPORT` env. Mock-first because nobody has hardware until
+   sidecar), `unix` (on-robot), `ssh` (laptop → the robot's sockets forwarded
+   over `ssh -L`, then `unix`). Selected via `DUCK_TRANSPORT` env. Mock-first because nobody has hardware until
    ~Dec; sim is where behaviour gets validated before then.
 3. **Server-side safety layer** (`src/safety.ts`) on top of robotd's own:
    velocity clamps, battery floor (15%) for motion, rate limiting, and a
@@ -44,26 +44,29 @@ sessions on this repo.
    Hub policy channel ships, because that's when it becomes DuckHub's deploy
    backend (see sibling repo `duckhub`).
 
-## Method names: ours vs upstream's (verified 2026-08-29)
+## Wire protocol: upstream's, verbatim (since 2026-08-29)
 
-Upstream now publishes the contract in `duck-ipc-proto/src/lib.rs` (commit
-590b986). Our internal names predate it and **do not match**. The sim sidecar
-accepts both; `unix`/`ssh` still send ours and must be renamed before hardware:
+Upstream publishes the contract in `duck-ipc-proto/src/lib.rs` (commit
+590b986). **`src/transport/protocol.ts` is the only place method names and
+enum spellings live**; every transport, the sidecar and the tools use it.
+The shapes that needed adapting, and where the adapter is:
 
-| ours (transport calls)        | upstream wire method                     | notes |
-|-------------------------------|------------------------------------------|-------|
-| `robot.intent {vx,vy,wz}`     | `robot.move {vx,vy,vyaw}` (notification) | continuous, last-writer-wins, deadman-stamped |
-| `robot.behavior {name}`       | `robot.do {skill}` skill ∈ ground_pick, kick_left, kick_right, sit_toggle, roulade | no `getup`, no `stand`; sit↔stand is one toggle |
-| —                             | `robot.head {neck_pitch,head_pitch,head_yaw,head_roll}` | sim implements it; no tool yet |
-| `robot.stop`                  | `robot.stop`                             | same |
-| `robot.health`                | `robot.health` → `HealthResult`          | `battery:{volts,percent}` — **percent, not fraction**; safety.ts reads `battery.fraction`, so the unix/ssh path needs an adapter |
-| `robot.state` (duck_monitor)  | `robot.state` frame via `robot.subscribe` | upstream is a subscription stream; one-shot = subscribe, take one, close |
-| `update.list`                 | `update.listInstalled`                   | |
-| `system.version`              | `system.info` (+ updaterd `hello`)       | |
+| agent-facing                | on the wire                                              | adapter |
+|-----------------------------|----------------------------------------------------------|---------|
+| `duck_walk {vx,vy,wz}`      | `robot.move {vx,vy,vyaw}` re-sent every 250 ms, then `robot.stop` | `walk()` in safety.ts (intents are deadman-stamped; a walk is a stream) |
+| `duck_behavior sit/stand`   | `robot.do {skill:"sit_toggle"}`                          | tool checks `state().policy === "sit"` first, so sit-while-seated is a no-op |
+| `duck_behavior getup`       | `robot.init` (power joints, ramp to home)                | gate "recovery"; on hardware a human rights the duck first |
+| `duck_behavior pickup/kick/roulade` | `robot.do {skill: ground_pick / kick_right / roulade}` | `BEHAVIORS` table in safety.ts |
+| `duck_behavior quack`       | `robot.sound {tag:"chirp"}`                              | (what `robotctl quack` plays) |
+| battery floor               | `robot.health` → `battery:{volts,percent}`               | `preMotionCheck` reads `percent` |
+| `duck_monitor`              | `robot.subscribe {hz:50}` → first `robot.state` frame    | `DuckTransport.state()`: unix/ssh subscribe-and-take-one; sim/mock answer `robot.state` directly |
+| `duck_version`              | `system.info` (configd)                                  | |
+| `duck_updates`              | `update.listInstalled {component:"daemon"}`              | |
 
-Also: `quack` is `robot.sound {tag}`, and bring-up (`robot.enable/init/relax`)
-is not exposed at all yet. Obs layout, control chain and battery mapping are
-ported verbatim in `sim/duck_sim.py` with line-level provenance.
+Intents sent as *requests* (with an id) are answered with `IntentResult`
+(`robotd/src/main.rs:2682`), so no notification path is needed. Not exposed
+yet: `robot.head`, `robot.look`, `robot.pose`, `robot.mouth`, `robot.enable`,
+`robot.relax`, `robot.shutdown`, `robot.setMode`.
 
 ## Sim transport (`DUCK_TRANSPORT=sim`)
 
@@ -92,17 +95,18 @@ ported verbatim in `sim/duck_sim.py` with line-level provenance.
 
 ## Transport roadmap
 
-- v0 ssh transport shells out to `robotctl` (correct but slow).
-- v1: forward the Unix sockets over ssh
-  (`ssh -L /tmp/robotd.sock:/run/robotd.sock ...`) and reuse UnixTransport
-  with remapped paths.
+- ~~v0 ssh transport shells out to `robotctl`~~ — dead end: robotctl has no
+  motion subcommands.
+- v1 (current): `SshTransport` forwards the three Unix sockets over
+  `ssh -N -L` into a temp dir and delegates to `UnixTransport`. Needs
+  OpenSSH ≥ 6.7 on both ends; no robot-side install.
 - v2 (maybe): WebRTC data-channel transport via mediad — same calls, works
   from a browser, no ssh. This is the interesting one for demos.
 
 ## Roadmap / TODO
 
-- [x] Verify RPC method names against upstream — done, table above. **Next:**
-      rename in `unix.ts`/`ssh.ts` and adapt `battery.percent` → fraction.
+- [x] Verify RPC method names against upstream and speak them verbatim —
+      done, `protocol.ts` + table above. Untested on hardware, obviously.
 - [x] `sim` transport: CPU MuJoCo + official ONNX policies (`sim/duck_sim.py`)
 - [x] `duck_camera` tool — sim renders; hardware path via mediad WebRTC still TODO
 - [ ] `duck_head` tool (`robot.head`) — sim already handles it
@@ -110,7 +114,8 @@ ported verbatim in `sim/duck_sim.py` with line-level provenance.
 - [x] `duck_monitor` — one-shot state sample (joints, gravity, odometry) — mock `robot.state`; method name provisional like the rest
 - [x] Tests: safety layer unit tests (`npm test`, node:test on dist)
 - [x] Tests: sim transport contract tests (fake stdio sidecar, no MuJoCo)
-- [ ] Tests: unix/ssh contract tests against a fake JSON-RPC socket
+- [x] Tests: unix contract tests against a fake robotd socket (incl.
+      subscribe → first frame); ssh forwarding argv
 - [ ] Publish: npm + MCP registries/directories once validated on hardware
 - [ ] Integration guide per client (Claude Desktop config, Cursor, smolagents)
 
@@ -133,10 +138,11 @@ ported verbatim in `sim/duck_sim.py` with line-level provenance.
   gated. Behaviors are gated by the `BEHAVIOR_GATES` table in `safety.ts`
   (quack: none; getup: recovery = allowUnhealthy, battery + rate limit still
   apply); the tool enum derives from that table — add behaviors there.
-- `duck_walk` is transport-independent: `walk()` in `safety.ts` re-sends the
-  intent every 250 ms for `duration_s` then sends `robot.stop`, because
-  upstream's `robot.move` is a deadman-stamped notification. `duck_stop`
-  interrupts it via `stopWalk()`.
+- `duck_walk` is transport-independent: `walk()` in `safety.ts` re-sends
+  `robot.move` every 250 ms for `duration_s` then sends `robot.stop`, because
+  upstream's intents are deadman-stamped. `duck_stop` interrupts it via
+  `stopWalk()`.
+- Never spell a wire method inline — import `M` from `transport/protocol.ts`.
 - Camera is a transport *capability* (`DuckTransport.snapshot?`), not an RPC
   name: sim renders, mock returns a placeholder, unix/ssh have none until
   mediad is wired.

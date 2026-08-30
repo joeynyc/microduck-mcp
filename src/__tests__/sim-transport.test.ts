@@ -38,13 +38,18 @@ describe("SimTransport", () => {
   test("passes params through and keeps concurrent calls straight", () =>
     withSim("ok", async (t) => {
       const [a, b, c] = await Promise.all([
-        t.call("robotd", "robot.intent", { vx: 0.1 }),
+        t.call("robotd", "robot.move", { vx: 0.1 }),
         t.call("robotd", "robot.health"),
-        t.call("robotd", "robot.intent", { vx: 0.3, ttl_s: 5 }),
+        t.call("robotd", "robot.move", { vx: 0.3, ttl_s: 5 }),
       ]);
       assert.deepEqual((a as any).applied, { vx: 0.1 });
       assert.equal((b as any).mode, "standing");
       assert.equal((c as any).ttl_s, 5);
+    }));
+
+  test("state() is the one-shot robot.state request", () =>
+    withSim("ok", async (t) => {
+      assert.equal((await t.state()).policy, "stand");
     }));
 
   test("snapshot() is the sim.camera method with its own timeout", () =>

@@ -3,6 +3,7 @@ import { createInterface } from "node:readline";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { M, RobotState } from "./protocol.js";
 import {
   DuckService,
   DuckTransport,
@@ -164,6 +165,11 @@ export class SimTransport implements DuckTransport {
 
   call(_service: DuckService, method: string, params?: Record<string, unknown>): Promise<unknown> {
     return this.send(method, params, this.callTimeoutMs);
+  }
+
+  /** The sidecar answers robot.state one-shot (no subscription needed). */
+  state(): Promise<RobotState> {
+    return this.send(M.robotState, {}, this.callTimeoutMs) as Promise<RobotState>;
   }
 
   snapshot(req: SnapshotRequest): Promise<Snapshot> {

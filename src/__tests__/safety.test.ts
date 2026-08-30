@@ -1,6 +1,7 @@
 import { test, describe, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import {
+  BEHAVIOR_NAMES,
   BEHAVIORS,
   clampVelocity,
   LIMITS,
@@ -16,9 +17,13 @@ import { DuckService, DuckTransport } from "../transport/types.js";
 function stub(health: unknown): DuckTransport & { calls: string[] } {
   return {
     calls: [],
+    async state() {
+      return { policy: "stand" } as any;
+    },
     async call(_s: DuckService, method: string) {
       this.calls.push(method);
       if (method === "robot.health") return health;
+      if (method === "robot.state") return { policy: "stand" };
       return {};
     },
     async ping() {
@@ -28,11 +33,11 @@ function stub(health: unknown): DuckTransport & { calls: string[] } {
   };
 }
 
-const OK = { healthy: true, mode: "standing", battery: { fraction: 0.8 } };
+const OK = { healthy: true, mode: "standing", battery: { volts: 7.9, percent: 80 } };
 
 describe("clampVelocity", () => {
   test("passes values inside the envelope through unchanged", () => {
-    assert.deepEqual(clampVelocity(0.1, -0.1, 0.5), { vx: 0.1, vy: -0.1, wz: 0.5 });
+    assert.deepEqual(clampVelocity(0.1, -0.1, 0.5), { vx: 0.1, vy: -0.1, vyaw: 0.5 });
   });
 
   test("clamps linear velocity to ±maxLinearVelocity", () => {
@@ -42,12 +47,12 @@ describe("clampVelocity", () => {
   });
 
   test("clamps yaw to ±maxYawRate", () => {
-    assert.equal(clampVelocity(0, 0, 99).wz, LIMITS.maxYawRate);
-    assert.equal(clampVelocity(0, 0, -99).wz, -LIMITS.maxYawRate);
+    assert.equal(clampVelocity(0, 0, 99).vyaw, LIMITS.maxYawRate);
+    assert.equal(clampVelocity(0, 0, -99).vyaw, -LIMITS.maxYawRate);
   });
 
   test("zero stays zero", () => {
-    assert.deepEqual(clampVelocity(0, 0, 0), { vx: 0, vy: 0, wz: 0 });
+    assert.deepEqual(clampVelocity(0, 0, 0), { vx: 0, vy: 0, vyaw: 0 });
   });
 });
 
@@ -61,12 +66,12 @@ describe("preMotionCheck", () => {
   });
 
   test("refuses motion below the battery floor", async () => {
-    const t = stub({ ...OK, battery: { fraction: LIMITS.minBatteryForMotion - 0.01 } });
+    const t = stub({ ...OK, battery: { volts: 6.8, percent: LIMITS.minBatteryForMotion * 100 - 1 } });
     await assert.rejects(() => preMotionCheck(t), /Battery at 14%.*motion floor/);
   });
 
   test("allows motion exactly at the battery floor", async () => {
-    const t = stub({ ...OK, battery: { fraction: LIMITS.minBatteryForMotion } });
+    const t = stub({ ...OK, battery: { volts: 6.8, percent: LIMITS.minBatteryForMotion * 100 } });
     await preMotionCheck(t);
   });
 
@@ -86,12 +91,12 @@ describe("preMotionCheck", () => {
   });
 
   test("allowUnhealthy does not bypass the battery floor", async () => {
-    const t = stub({ healthy: false, mode: "fallen", battery: { fraction: 0.05 } });
+    const t = stub({ healthy: false, mode: "fallen", battery: { volts: 6.7, percent: 5 } });
     await assert.rejects(() => preMotionCheck(t, { allowUnhealthy: true }), /Battery/);
   });
 
   test("battery floor is checked before the healthy flag", async () => {
-    const t = stub({ healthy: false, mode: "fallen", battery: { fraction: 0.05 } });
+    const t = stub({ healthy: false, mode: "fallen", battery: { volts: 6.7, percent: 5 } });
     await assert.rejects(() => preMotionCheck(t), /Battery/);
   });
 
@@ -104,7 +109,7 @@ describe("preMotionCheck", () => {
   });
 
   test("a refused command does not consume the cooldown", async () => {
-    const low = stub({ ...OK, battery: { fraction: 0.05 } });
+    const low = stub({ ...OK, battery: { volts: 6.7, percent: 5 } });
     await assert.rejects(() => preMotionCheck(low));
     // Immediately afterwards a good command must still be allowed.
     await preMotionCheck(stub(OK));
@@ -122,6 +127,9 @@ describe("preMotionCheck", () => {
       async call() {
         throw new Error("ECONNREFUSED /run/robotd.sock");
       },
+      async state() {
+        throw new Error("ECONNREFUSED /run/robotd.sock");
+      },
       async ping() {
         return false;
       },
@@ -135,17 +143,17 @@ describe("preBehaviorCheck", () => {
   beforeEach(() => resetMotionCooldown());
 
   test("quack is never gated", async () => {
-    await preBehaviorCheck(stub({ healthy: false, battery: { fraction: 0.01 } }), "quack");
+    await preBehaviorCheck(stub({ healthy: false, battery: { volts: 6.6, percent: 1 } }), "quack");
   });
 
   test("getup is allowed on a fallen robot, but not on an empty battery", async () => {
     await preBehaviorCheck(stub({ ...OK, healthy: false, mode: "fallen" }), "getup");
     resetMotionCooldown();
-    await assert.rejects(() => preBehaviorCheck(stub({ healthy: false, battery: { fraction: 0.05 } }), "getup"), /Battery/);
+    await assert.rejects(() => preBehaviorCheck(stub({ healthy: false, battery: { volts: 6.7, percent: 5 } }), "getup"), /Battery/);
   });
 
   test("every other behavior is fully gated", async () => {
-    for (const b of BEHAVIORS.filter((b) => b !== "quack" && b !== "getup")) {
+    for (const b of BEHAVIOR_NAMES.filter((b) => b !== "quack" && b !== "getup")) {
       resetMotionCooldown();
       await assert.rejects(() => preBehaviorCheck(stub({ ...OK, healthy: false }), b), /unhealthy/);
     }
@@ -155,8 +163,8 @@ describe("preBehaviorCheck", () => {
 describe("walk", () => {
   test("re-sends the intent for the duration, then stops", async () => {
     const t = stub(OK);
-    const r = await walk(t, { vx: 0.1, vy: 0, wz: 0 }, 0.25, 50);
-    const intents = t.calls.filter((c) => c === "robot.intent").length;
+    const r = await walk(t, { vx: 0.1, vy: 0, vyaw: 0 }, 0.25, 50);
+    const intents = t.calls.filter((c) => c === "robot.move").length;
     assert.ok(intents >= 3 && intents <= 7, `expected ~5 intents, got ${intents}`);
     assert.equal(t.calls.at(-1), "robot.stop");
     assert.equal(r.interrupted, false);
@@ -165,7 +173,7 @@ describe("walk", () => {
 
   test("stopWalk() interrupts an in-flight walk and leaves the stop to the caller", async () => {
     const t = stub(OK);
-    const p = walk(t, { vx: 0.1, vy: 0, wz: 0 }, 5, 20);
+    const p = walk(t, { vx: 0.1, vy: 0, vyaw: 0 }, 5, 20);
     await new Promise((r) => setTimeout(r, 60));
     stopWalk();
     const r = await p;
@@ -179,11 +187,24 @@ describe("walk", () => {
       async call() {
         throw new Error("refused: robot is fallen/limp");
       },
+      async state() {
+        throw new Error("unreachable");
+      },
       async ping() {
         return true;
       },
       async close() {},
     };
-    await assert.rejects(() => walk(t, { vx: 0.1, vy: 0, wz: 0 }, 1), /fallen/);
+    await assert.rejects(() => walk(t, { vx: 0.1, vy: 0, vyaw: 0 }, 1), /fallen/);
+  });
+});
+
+describe("BEHAVIORS wire table", () => {
+  test("every behavior maps to an upstream method", () => {
+    for (const b of BEHAVIOR_NAMES) {
+      assert.match(BEHAVIORS[b].method, /^robot\.(do|init|sound)$/);
+    }
+    assert.deepEqual(BEHAVIORS.sit.params, { skill: "sit_toggle" });
+    assert.deepEqual(BEHAVIORS.quack.params, { tag: "chirp" });
   });
 });

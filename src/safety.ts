@@ -1,3 +1,4 @@
+import { HealthResult, M, Skill, SoundTag } from "./transport/protocol.js";
 import { DuckTransport } from "./transport/types.js";
 
 /**
@@ -19,26 +20,28 @@ export const LIMITS = {
 } as const;
 
 /**
- * How each behavior is gated. "motion" = full preMotionCheck; "recovery" =
- * preMotionCheck with allowUnhealthy (a fallen robot is unhealthy by
- * definition, and refusing the one command that fixes that would strand it);
- * "none" = never gated. The tool enum is derived from this table so adding a
- * behavior is one edit.
+ * What each agent-facing behavior is on the wire, and how it is gated.
+ * Gates: "motion" = full preMotionCheck; "recovery" = preMotionCheck with
+ * allowUnhealthy (a fallen robot is unhealthy by definition, and refusing the
+ * one command that fixes that would strand it); "none" = never gated.
+ * The tool enum is derived from this table so adding a behavior is one edit.
  */
-export const BEHAVIOR_GATES = {
-  sit: "motion",
-  stand: "motion",
-  getup: "recovery",
-  pickup: "motion",
-  kick: "motion",
-  roulade: "motion",
-  quack: "none",
-} as const;
-export type Behavior = keyof typeof BEHAVIOR_GATES;
-export const BEHAVIORS = Object.keys(BEHAVIOR_GATES) as [Behavior, ...Behavior[]];
+export const BEHAVIORS = {
+  sit: { gate: "motion", method: M.robotDo, params: { skill: "sit_toggle" satisfies Skill } },
+  stand: { gate: "motion", method: M.robotDo, params: { skill: "sit_toggle" satisfies Skill } },
+  /** robot.init powers the joints and ramps to the home pose. On hardware a
+   *  human rights the robot first; in sim it is set upright in place. */
+  getup: { gate: "recovery", method: M.robotInit, params: {} },
+  pickup: { gate: "motion", method: M.robotDo, params: { skill: "ground_pick" satisfies Skill } },
+  kick: { gate: "motion", method: M.robotDo, params: { skill: "kick_right" satisfies Skill } },
+  roulade: { gate: "motion", method: M.robotDo, params: { skill: "roulade" satisfies Skill } },
+  quack: { gate: "none", method: M.robotSound, params: { tag: "chirp" satisfies SoundTag } },
+} as const satisfies Record<string, { gate: "motion" | "recovery" | "none"; method: string; params: object }>;
+export type Behavior = keyof typeof BEHAVIORS;
+export const BEHAVIOR_NAMES = Object.keys(BEHAVIORS) as [Behavior, ...Behavior[]];
 
 export async function preBehaviorCheck(t: DuckTransport, name: Behavior): Promise<void> {
-  const gate = BEHAVIOR_GATES[name];
+  const gate = BEHAVIORS[name].gate;
   if (gate === "none") return;
   await preMotionCheck(t, { allowUnhealthy: gate === "recovery" });
 }
@@ -52,30 +55,32 @@ export function resetMotionCooldown(): void {
   lastMotionAt = 0;
 }
 
-export function clampVelocity(vx: number, vy: number, wz: number) {
+export type Twist = { vx: number; vy: number; vyaw: number };
+
+export function clampVelocity(vx: number, vy: number, vyaw: number): Twist {
   const clamp = (v: number, lim: number) => Math.max(-lim, Math.min(lim, v));
   return {
     vx: clamp(vx, LIMITS.maxLinearVelocity),
     vy: clamp(vy, LIMITS.maxLinearVelocity),
-    wz: clamp(wz, LIMITS.maxYawRate),
+    vyaw: clamp(vyaw, LIMITS.maxYawRate),
   };
 }
 
 /**
  * Drive a velocity intent for `durationS`, transport-independently: robotd's
- * `robot.move` is a notification whose expiry is the deadman, so a walk of
- * any length is a stream of intents followed by a stop. Re-sends every
- * `intervalMs`, then sends robot.stop. Returns early if stopWalk() is called
- * (duck_stop) or the transport refuses an intent (fallen, unreachable).
+ * `robot.move` is a deadman-stamped intent, so a walk of any length is a
+ * stream of intents followed by a stop. Re-sends every `intervalMs`, then
+ * sends robot.stop. Returns early if stopWalk() is called (duck_stop) or the
+ * transport refuses an intent (fallen, unreachable).
  */
 export async function walk(
   t: DuckTransport,
-  v: { vx: number; vy: number; wz: number },
+  v: Twist,
   durationS: number,
   intervalMs = 250,
-): Promise<{ applied: unknown; duration_s: number; interrupted: boolean }> {
+): Promise<{ applied: Twist; result: unknown; duration_s: number; interrupted: boolean }> {
   const epoch = ++walkEpoch;
-  const applied = await t.call("robotd", "robot.intent", v);
+  const result = await t.call("robotd", M.robotMove, v);
   const until = Date.now() + durationS * 1000;
   let interrupted = false;
   while (Date.now() < until) {
@@ -84,10 +89,10 @@ export async function walk(
       interrupted = true;
       break;
     }
-    if (Date.now() < until) await t.call("robotd", "robot.intent", v);
+    if (Date.now() < until) await t.call("robotd", M.robotMove, v);
   }
-  if (!interrupted) await t.call("robotd", "robot.stop");
-  return { applied, duration_s: durationS, interrupted };
+  if (!interrupted) await t.call("robotd", M.robotStop);
+  return { applied: v, result, duration_s: durationS, interrupted };
 }
 
 /** End any in-flight walk() loop. duck_stop calls this before robot.stop. */
@@ -111,15 +116,11 @@ export async function preMotionCheck(
       `Rate limited: wait ${LIMITS.motionCooldownMs}ms between motion commands.`,
     );
   }
-  const health = (await t.call("robotd", "robot.health")) as {
-    healthy?: boolean;
-    battery?: { fraction?: number };
-    mode?: string;
-  };
-  const frac = health?.battery?.fraction;
-  if (typeof frac === "number" && frac < LIMITS.minBatteryForMotion) {
+  const health = (await t.call("robotd", M.robotHealth)) as HealthResult;
+  const pct = health?.battery?.percent;
+  if (typeof pct === "number" && pct / 100 < LIMITS.minBatteryForMotion) {
     throw new Error(
-      `Battery at ${(frac * 100).toFixed(0)}% — below the ${
+      `Battery at ${pct.toFixed(0)}% — below the ${
         LIMITS.minBatteryForMotion * 100
       }% motion floor. Charge the duck. (Note: 0% is the hardware cutoff ` +
         `where robotd sits the robot down; this floor keeps margin above it.)`,
@@ -127,7 +128,7 @@ export async function preMotionCheck(
   }
   if (health?.healthy === false && !opts.allowUnhealthy) {
     throw new Error(
-      `Robot reports unhealthy (mode: ${health?.mode ?? "unknown"}). ` +
+      `Robot reports unhealthy (${health?.reason ?? `mode: ${health?.mode ?? "unknown"}`}). ` +
         `Run duck_health for details before commanding motion.`,
     );
   }

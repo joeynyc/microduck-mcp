@@ -64,7 +64,7 @@ Or for Claude Code: `claude mcp add microduck -e DUCK_TRANSPORT=mock -- node /pa
 | Tool | What it does | Guarded? |
 |---|---|---|
 | `duck_health` | Battery, temps, loop rate, loaded policy | read-only |
-| `duck_version` | Running vs installed software per daemon | read-only |
+| `duck_version` | Robot name, serial, uptime | read-only |
 | `duck_updates` | Installed releases | read-only |
 | `duck_monitor` | One-shot state: joints, gravity, gyro, odometry, current intent | read-only |
 | `duck_camera` | PNG frame: head camera or follow/front/side/top view (sim today) | read-only |
@@ -87,7 +87,7 @@ is always available.
 | `mock` (default) | Canned state, instant | nothing |
 | `sim` | Headless CPU MuJoCo running the official `alpha_*.onnx` policies with robotd's control chain, in a Python sidecar (`sim/duck_sim.py`) | `sim/setup.sh` |
 | `unix` | The robot's own daemons over `/run/*.sock` | running on the duck |
-| `ssh` | `robotctl` over ssh | a duck on the network |
+| `ssh` | The same sockets forwarded over `ssh -L`, then `unix` | a duck on the network, ssh access |
 
 All four sit behind one `DuckTransport` interface, so the tools — and the
 safety layer — are identical whether the duck is simulated or real.
@@ -99,9 +99,9 @@ and rolls; it just isn't a speed benchmark.
 
 ## Status
 
-Pre-hardware. The sim path is validated; the `unix`/`ssh` paths still use
-provisional method names that differ from upstream's now-published
-`duck-ipc-proto` (mapping table in `CLAUDE.md`) and will be renamed before
-ducks ship (~Dec 2026).
+Pre-hardware. Every transport speaks upstream's published wire protocol
+(`duck-ipc-proto`, see `src/transport/protocol.ts`); the sim path is
+validated end to end, the `unix`/`ssh` paths against a fake daemon only —
+first contact with a real duck is ~Dec 2026.
 
 Apache-2.0-friendly; upstream robot software is Apache 2.0.

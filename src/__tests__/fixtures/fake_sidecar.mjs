@@ -17,8 +17,9 @@ if (mode !== "never-ready") {
 process.stderr.write("fake sidecar up\n");
 
 const handlers = {
-  "robot.health": () => ({ healthy: true, mode: "standing", battery: { fraction: 0.8 } }),
-  "robot.intent": (p) => ({ applied: p, ttl_s: p.ttl_s ?? 2 }),
+  "robot.health": () => ({ healthy: true, mode: "standing", battery: { volts: 7.9, percent: 80 } }),
+  "robot.move": (p) => ({ accepted: true, applied: p, ttl_s: p.ttl_s ?? 2 }),
+  "robot.state": () => ({ t: 1, policy: "stand", move: { requested: [0, 0, 0], applied: [0, 0, 0] }, safety: { fallen: false, limp: false }, loop: { hz: 50, missed: 0 } }),
   "sim.camera": (p) => ({ png_base64: "iVBORw0KGgo=", width: p.width ?? 1, height: p.height ?? 1, view: p.view }),
   slow: () => undefined, // never answers
 };

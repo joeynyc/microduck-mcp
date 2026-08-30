@@ -13,12 +13,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { DuckTransport } from "./transport/types.js";
+import { DAEMON_COMPONENT, M } from "./transport/protocol.js";
 import { MockTransport } from "./transport/mock.js";
 import { UnixTransport } from "./transport/unix.js";
 import { SshTransport } from "./transport/ssh.js";
 import { SimTransport } from "./transport/sim.js";
 import {
   BEHAVIORS,
+  BEHAVIOR_NAMES,
   clampVelocity,
   LIMITS,
   preBehaviorCheck,
@@ -61,7 +63,7 @@ server.registerTool(
   {
     title: "Duck health",
     description:
-      "Full hardware+software health report: battery (fraction and volts), " +
+      "Full hardware+software health report: battery (volts and percent), " +
       "control-loop rate, servo/board temperatures, loaded policy, and " +
       "whether the robot considers itself healthy. Read-only and always " +
       "safe to call. Call this FIRST in any session, and again before any " +
@@ -70,7 +72,7 @@ server.registerTool(
   },
   async () => {
     try {
-      return json(await duck.call("robotd", "robot.health"));
+      return json(await duck.call("robotd", M.robotHealth));
     } catch (e) {
       return fail(e);
     }
@@ -80,15 +82,13 @@ server.registerTool(
 server.registerTool(
   "duck_version",
   {
-    title: "Duck software version",
-    description:
-      "What every daemon is running vs what is installed. Read-only. Useful " +
-      "after updates: a daemon serving old code looks exactly like a bug.",
+    title: "Duck identity and uptime",
+    description: "The robot's name, serial and uptime (configd system.info). Read-only.",
     inputSchema: {},
   },
   async () => {
     try {
-      return json(await duck.call("configd", "system.version"));
+      return json(await duck.call("configd", M.systemInfo));
     } catch (e) {
       return fail(e);
     }
@@ -100,14 +100,14 @@ server.registerTool(
   {
     title: "List installed releases",
     description:
-      "Installed software releases and which one is current. Read-only. " +
+      "Installed daemon releases and which one is active/golden. Read-only. " +
       "(Installing/rolling back is deliberately NOT exposed as a tool yet — " +
       "see CLAUDE.md 'Deliberately excluded'.)",
     inputSchema: {},
   },
   async () => {
     try {
-      return json(await duck.call("updaterd", "update.list"));
+      return json(await duck.call("updaterd", M.updateListInstalled, { component: DAEMON_COMPONENT }));
     } catch (e) {
       return fail(e);
     }
@@ -119,18 +119,56 @@ server.registerTool(
   {
     title: "Duck state sample",
     description:
-      "One-shot snapshot of the robot's physical state: every joint's " +
-      "position/velocity/temperature, the gravity vector in the body frame " +
-      "(≈[0,0,9.81] when upright — a large X or Y component means it has " +
-      "fallen), gyro, odometry (x, y, yaw since boot), and the velocity " +
-      "intent currently applied. Read-only and always safe to call. Use it " +
-      "to confirm a walk actually moved the robot, or to check posture " +
-      "before/after a behavior. For battery and temps use duck_health.",
+      "One robot.state frame: which policy is driving, the velocity requested " +
+      "vs applied (and what limited it), joints, gravity in the body frame " +
+      "(≈[0,0,-1] when upright — a large X or Y component means it has " +
+      "fallen), odometry, and the safety flags (fallen, limp, busy). Read-only " +
+      "and always safe to call. Use it to confirm a walk actually moved the " +
+      "robot, or to check posture before/after a behavior. For battery and " +
+      "temps use duck_health.",
     inputSchema: {},
   },
   async () => {
     try {
-      return json(await duck.call("robotd", "robot.state"));
+      return json(await duck.state());
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.registerTool(
+  "duck_camera",
+  {
+    title: "Duck camera",
+    description:
+      "A still frame of what the duck sees or looks like right now, returned " +
+      "as a PNG image. view='head' is the robot's own head camera; 'follow' " +
+      "(default), 'front', 'side' and 'top' are third-person views around the " +
+      "robot. Read-only, never moves the robot. Available on the sim " +
+      "transport today; on hardware it will come from mediad's WebRTC stream " +
+      "(not wired yet) and the mock transport returns a placeholder.",
+    inputSchema: {
+      view: z
+        .enum(["head", "follow", "front", "side", "top"])
+        .default("follow")
+        .describe("Which camera."),
+      width: z.number().int().min(64).max(640).default(320),
+      height: z.number().int().min(48).max(480).default(240),
+    },
+  },
+  async (req) => {
+    try {
+      if (!duck.snapshot) {
+        return fail(new Error(`no camera on the ${process.env.DUCK_TRANSPORT ?? "mock"} transport`));
+      }
+      const { png_base64, ...meta } = await duck.snapshot(req);
+      return {
+        content: [
+          { type: "image" as const, data: png_base64, mimeType: "image/png" },
+          { type: "text" as const, text: JSON.stringify(meta) },
+        ],
+      };
     } catch (e) {
       return fail(e);
     }
@@ -179,58 +217,31 @@ server.registerTool(
   {
     title: "Run a behavior",
     description:
-      "Trigger a named built-in behavior: sit, stand, getup (recover from a " +
-      "fall — on hardware a human picks the duck up; in sim it is set " +
-      "upright in place), pickup (beak to floor, grab), kick, roulade " +
-      "(forward roll), quack. Scripted moves take 0.5–3 s; call duck_monitor " +
-      "to see when 'busy' clears. Battery- and health-gated like walking " +
-      "(quack is free).",
+      "Trigger a named built-in behavior: sit, stand, getup (power the joints " +
+      "and rise to the home pose after a fall — on hardware a human rights " +
+      "the duck first; in sim it is set upright in place), pickup (beak to " +
+      "floor, grab), kick, roulade (forward roll), quack. sit/stand are " +
+      "no-ops if already in that posture. Scripted moves take 0.5–3 s; call " +
+      "duck_monitor to see when 'busy' clears. Battery- and health-gated " +
+      "like walking (quack is free).",
     inputSchema: {
-      name: z.enum(BEHAVIORS).describe("Which behavior to run."),
+      name: z.enum(BEHAVIOR_NAMES).describe("Which behavior to run."),
     },
   },
   async ({ name }) => {
     try {
       await preBehaviorCheck(duck, name);
-      return json(await duck.call("robotd", "robot.behavior", { name }));
-    } catch (e) {
-      return fail(e);
-    }
-  },
-);
-
-server.registerTool(
-  "duck_camera",
-  {
-    title: "Duck camera",
-    description:
-      "A still frame of what the duck sees or looks like right now, returned " +
-      "as a PNG image. view='head' is the robot's own head camera; 'follow' " +
-      "(default), 'front', 'side' and 'top' are third-person views around the " +
-      "robot. Read-only, never moves the robot. Available on the sim " +
-      "transport today; on hardware it will come from mediad's WebRTC stream " +
-      "(not wired yet) and the mock transport returns a placeholder.",
-    inputSchema: {
-      view: z
-        .enum(["head", "follow", "front", "side", "top"])
-        .default("follow")
-        .describe("Which camera."),
-      width: z.number().int().min(64).max(640).default(320),
-      height: z.number().int().min(48).max(480).default(240),
-    },
-  },
-  async (req) => {
-    try {
-      if (!duck.snapshot) {
-        return fail(new Error(`no camera on the ${process.env.DUCK_TRANSPORT ?? "mock"} transport`));
+      // Upstream's sit↔stand is one toggle; the daemon knows which way. We
+      // check the frame so "sit" while seated doesn't stand the duck up.
+      if (name === "sit" || name === "stand") {
+        const seated = (await duck.state()).policy === "sit";
+        if (seated === (name === "sit")) {
+          return json({ behavior: name, started: false, note: `already ${name === "sit" ? "sitting" : "standing"}` });
+        }
       }
-      const { png_base64, ...meta } = await duck.snapshot(req);
-      return {
-        content: [
-          { type: "image" as const, data: png_base64, mimeType: "image/png" },
-          { type: "text" as const, text: JSON.stringify(meta) },
-        ],
-      };
+      const { method, params } = BEHAVIORS[name];
+      const result = await duck.call("robotd", method, { ...params });
+      return json({ behavior: name, started: true, wire: { method, params }, result });
     } catch (e) {
       return fail(e);
     }
@@ -250,7 +261,7 @@ server.registerTool(
   async () => {
     try {
       stopWalk();
-      return json(await duck.call("robotd", "robot.stop"));
+      return json(await duck.call("robotd", M.robotStop));
     } catch (e) {
       return fail(e);
     }
