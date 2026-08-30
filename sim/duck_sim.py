@@ -204,6 +204,7 @@ class DuckSim:
         self.deadman_s = deadman_s
         self.renderers: OrderedDict[tuple[int, int], object] = OrderedDict()
         self.t0 = time.monotonic()
+        self.recorder: Recorder | None = None
         self.reset()
 
     # ---- state -----------------------------------------------------------
@@ -509,15 +510,10 @@ class DuckSim:
         self.reset()
         return {"reset": True, "sim": True}
 
-    def camera(self, p: dict) -> dict:
-        # Runs on the loop thread (the GL context lives here): one frame costs
-        # roughly half a tick, so a camera call may bump `missed` by one.
+    def render(self, view: str, w: int, h: int, distance: float = 0.8) -> np.ndarray:
+        """One RGB frame. Runs on the loop thread (the GL context lives here):
+        a frame costs roughly half a tick, so a camera call may bump `missed`."""
         mujoco = self.mujoco
-        from PIL import Image
-        w = int(clamp(int(p.get("width", 320)), *CAM_W))
-        h = int(clamp(int(p.get("height", 240)), *CAM_H))
-        view = str(p.get("view", "follow"))
-
         cam = mujoco.MjvCamera()
         cam.type = mujoco.mjtCamera.mjCAMERA_FREE
         if view == "head":
@@ -541,7 +537,7 @@ class DuckSim:
             if view not in presets:
                 raise RpcError(-32602, f"unknown view {view!r}; use head|follow|front|side|top")
             cam.lookat[:] = self.data.xpos[self.trunk]
-            cam.distance = float(p.get("distance", 0.8))
+            cam.distance = distance
             cam.azimuth, cam.elevation = presets[view]
             fovy = float(self.model.vis.global_.fovy)
 
@@ -558,8 +554,16 @@ class DuckSim:
             r.update_scene(self.data, camera=cam)
         finally:
             self.model.vis.global_.fovy = saved
+        return r.render()
+
+    def camera(self, p: dict) -> dict:
+        from PIL import Image
+        w = int(clamp(int(p.get("width", 320)), *CAM_W))
+        h = int(clamp(int(p.get("height", 240)), *CAM_H))
+        view = str(p.get("view", "follow"))
+        img = self.render(view, w, h, float(p.get("distance", 0.8)))
         buf = io.BytesIO()
-        Image.fromarray(r.render()).save(buf, format="PNG")
+        Image.fromarray(img).save(buf, format="PNG")
         return {"png_base64": base64.b64encode(buf.getvalue()).decode("ascii"),
                 "width": w, "height": h, "view": view, "t": round(self.now(), 3), "sim": True}
 
@@ -568,6 +572,38 @@ class DuckSim:
 
     def list_installed(self, p: dict) -> dict:
         return [{"version": "0.0.0-sim", "active": True, "golden": True, "component": p.get("component", "daemon")}]
+
+
+class Recorder:
+    """Continuous capture of one view at a fixed fps, for demo videos. Frames go
+    to `<dir>/NNNNNN.jpg`, wall-clock timestamps (epoch seconds, one per
+    frame) to `<dir>/times.txt`, so a compositor can sync the video with
+    events logged elsewhere. Enabled by DUCK_SIM_RECORD=<dir>."""
+
+    def __init__(self, path: str, fps: float, view: str, w: int, h: int, distance: float):
+        from PIL import Image  # noqa: F401 — fail early if Pillow is missing
+        self.dir = Path(path)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.fps, self.view, self.w, self.h, self.distance = fps, view, w, h, distance
+        self.times = open(self.dir / "times.txt", "w")
+        self.next_at = time.time()
+        self.frames = 0
+
+    def maybe_capture(self, sim: DuckSim):
+        from PIL import Image
+        now = time.time()
+        if now < self.next_at:
+            return
+        # Catch up to the wall clock but never render more than one frame per tick.
+        self.next_at = max(self.next_at + 1.0 / self.fps, now - 1.0 / self.fps)
+        Image.fromarray(sim.render(self.view, self.w, self.h, self.distance)).save(
+            self.dir / f"{self.frames:06d}.jpg", quality=90)
+        self.times.write(f"{now:.4f}\n")
+        self.times.flush()
+        self.frames += 1
+
+    def close(self):
+        self.times.close()
 
 
 # Wire methods → handlers. Names are upstream's (duck-ipc-proto/src/lib.rs);
@@ -602,6 +638,11 @@ def main():
     ap.add_argument("--battery-v", type=float, default=float(os.environ.get("DUCK_SIM_BATTERY_V", "7.9")))
     ap.add_argument("--deadman-s", type=float, default=float(os.environ.get("DUCK_SIM_DEADMAN_S", "2.0")))
     ap.add_argument("--no-realtime", action="store_true", help="run as fast as possible (tests)")
+    ap.add_argument("--record", default=os.environ.get("DUCK_SIM_RECORD"), help="capture <path>.rgb/.times continuously")
+    ap.add_argument("--record-fps", type=float, default=float(os.environ.get("DUCK_SIM_RECORD_FPS", "30")))
+    ap.add_argument("--record-view", default=os.environ.get("DUCK_SIM_RECORD_VIEW", "follow"))
+    ap.add_argument("--record-size", default=os.environ.get("DUCK_SIM_RECORD_SIZE", "640x480"))
+    ap.add_argument("--record-distance", type=float, default=float(os.environ.get("DUCK_SIM_RECORD_DISTANCE", "0.8")))
     args = ap.parse_args()
 
     out_lock = threading.Lock()
@@ -619,8 +660,12 @@ def main():
 
     t = time.time()
     sim = DuckSim(scene, policies, args.battery_v, args.deadman_s)
+    if args.record:
+        w, h = (int(x) for x in args.record_size.lower().split("x"))
+        sim.recorder = Recorder(args.record, args.record_fps, args.record_view, w, h, args.record_distance)
     send({"jsonrpc": "2.0", "method": "sim.ready", "params": {
-        "policies": sorted(sim.nets), "hz": 1 / CONTROL_DT, "load_s": round(time.time() - t, 2)}})
+        "policies": sorted(sim.nets), "hz": 1 / CONTROL_DT, "load_s": round(time.time() - t, 2),
+        "recording": bool(args.record)}})
 
     inbox: queue.Queue = queue.Queue()
 
@@ -662,10 +707,14 @@ def main():
             except queue.Empty:
                 break
             if line is None:
+                if sim.recorder:
+                    sim.recorder.close()
                 return
             serve(line)
 
         sim.tick()
+        if sim.recorder:
+            sim.recorder.maybe_capture(sim)
         now = time.monotonic()
         sim.hz_est += 0.05 * ((1.0 / max(now - last_tick, 1e-6)) - sim.hz_est)
         last_tick = now

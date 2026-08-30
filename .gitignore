@@ -4,3 +4,4 @@ sim/.venv/
 sim/vendor/
 demo-out/
 __pycache__/
+demo-rec/

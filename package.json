@@ -8,7 +8,9 @@
     "start": "node dist/index.js",
     "dev": "tsc && node dist/index.js",
     "test": "tsc && node --test \"dist/**/*.test.js\"",
-    "demo": "tsc && node scripts/demo.mjs"
+    "demo": "tsc && node scripts/demo.mjs",
+    "record-demo": "node scripts/record-demo.mjs demo-rec",
+    "compose-demo": "sim/.venv/bin/python scripts/compose-demo.py demo-rec"
   },
   "keywords": [
     "mcp",
