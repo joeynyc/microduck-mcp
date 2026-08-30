@@ -102,6 +102,10 @@ and rolls; it just isn't a speed benchmark.
 - [MicroduckHub](https://microduckhub.com) — DuckHub, the community policy browser this server will back once upstream's M8 model channel ships.
 - [awesome-microduck](https://github.com/joeynyc/awesome-microduck) — the curated ecosystem list.
 
+## Not an official project
+
+Community project — not affiliated with, endorsed by, or sponsored by Pollen Robotics or Hugging Face. Microduck is their product; this is an independent client for it, and product names and logos belong to their respective owners.
+
 ## Status
 
 Pre-hardware. Every transport speaks upstream's published wire protocol
