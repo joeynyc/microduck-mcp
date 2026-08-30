@@ -97,6 +97,11 @@ commands (verified identical to upstream's own `infer_policy.py`). Expect
 ~0.08 m/s at the 0.25 m/s cap and weak yaw. It walks, sits, stands, kicks
 and rolls; it just isn't a speed benchmark.
 
+## Ecosystem
+
+- [MicroduckHub](https://microduckhub.com) — DuckHub, the community policy browser this server will back once upstream's M8 model channel ships.
+- [awesome-microduck](https://github.com/joeynyc/awesome-microduck) — the curated ecosystem list.
+
 ## Status
 
 Pre-hardware. Every transport speaks upstream's published wire protocol
