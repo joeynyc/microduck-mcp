@@ -1,5 +1,5 @@
 import net from "node:net";
-import { DuckService, DuckTransport, JsonRpcResponse } from "./types.js";
+import { DuckService, DuckTransport, JsonRpcResponse, pingViaHealth, rpcErrorMessage } from "./types.js";
 
 const SOCKETS: Record<DuckService, string> = {
   robotd: "/run/robotd.sock",
@@ -59,13 +59,8 @@ export class UnixTransport implements DuckTransport {
     });
   }
 
-  async ping(): Promise<boolean> {
-    try {
-      await this.call("robotd", "robot.health");
-      return true;
-    } catch {
-      return false;
-    }
+  ping(): Promise<boolean> {
+    return pingViaHealth(this);
   }
 
   async close(): Promise<void> {

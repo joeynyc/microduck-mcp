@@ -3,7 +3,16 @@ import { createInterface } from "node:readline";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DuckService, DuckTransport } from "./types.js";
+import {
+  DuckService,
+  DuckTransport,
+  JsonRpcRequest,
+  JsonRpcResponse,
+  Snapshot,
+  SnapshotRequest,
+  pingViaHealth,
+  rpcErrorMessage,
+} from "./types.js";
 
 /**
  * Sim transport — a headless CPU-MuJoCo Microduck running the official
@@ -24,12 +33,14 @@ export interface SimTransportOptions {
   python?: string;
   script?: string;
   args?: string[];
-  env?: NodeJS.ProcessEnv;
   /** ms to wait for the sidecar's `sim.ready` notification. */
   readyTimeoutMs?: number;
-  /** Default per-call timeout, ms. */
+  /** Per-call timeout, ms. Snapshots get their own, longer one. */
   callTimeoutMs?: number;
 }
+
+/** A notification from the sidecar (no id) or a response (with id). */
+type SidecarMessage = JsonRpcResponse | { method: string; params?: Record<string, unknown> };
 
 type Pending = {
   resolve: (v: unknown) => void;
@@ -37,103 +48,87 @@ type Pending = {
   timer: NodeJS.Timeout;
 };
 
-const here = dirname(fileURLToPath(import.meta.url));
-const repoRoot = join(here, "..", "..");
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const SNAPSHOT_TIMEOUT_MS = 30_000;
 
 export class SimTransport implements DuckTransport {
+  private readonly python: string;
+  private readonly script: string;
+  private readonly args: string[];
+  private readonly readyTimeoutMs: number;
+  private readonly callTimeoutMs: number;
+
   private proc?: ChildProcessWithoutNullStreams;
   private ready?: Promise<void>;
   private pending = new Map<number, Pending>();
   private nextId = 1;
   private exited?: Error;
-  readonly opts: Required<Pick<SimTransportOptions, "python" | "script" | "args" | "readyTimeoutMs" | "callTimeoutMs">> &
-    SimTransportOptions;
 
   constructor(opts: SimTransportOptions = {}) {
-    this.opts = {
-      python: opts.python ?? process.env.DUCK_SIM_PYTHON ?? join(repoRoot, "sim", ".venv", "bin", "python"),
-      script: opts.script ?? process.env.DUCK_SIM_SCRIPT ?? join(repoRoot, "sim", "duck_sim.py"),
-      args: opts.args ?? (process.env.DUCK_SIM_ARGS?.split(/\s+/).filter(Boolean) ?? []),
-      readyTimeoutMs: opts.readyTimeoutMs ?? 60_000,
-      callTimeoutMs: opts.callTimeoutMs ?? 10_000,
-      env: opts.env,
-    };
+    this.python = opts.python ?? process.env.DUCK_SIM_PYTHON ?? join(repoRoot, "sim", ".venv", "bin", "python");
+    this.script = opts.script ?? process.env.DUCK_SIM_SCRIPT ?? join(repoRoot, "sim", "duck_sim.py");
+    this.args = opts.args ?? (process.env.DUCK_SIM_ARGS?.split(/\s+/).filter(Boolean) ?? []);
+    this.readyTimeoutMs = opts.readyTimeoutMs ?? 60_000;
+    this.callTimeoutMs = opts.callTimeoutMs ?? 10_000;
   }
 
   /** Spawn the sidecar (once) and wait for `sim.ready`. */
   start(): Promise<void> {
     if (this.ready) return this.ready;
     this.ready = new Promise<void>((resolve, reject) => {
-      if (!existsSync(this.opts.script)) {
-        reject(new Error(`sim sidecar not found at ${this.opts.script}`));
+      if (!existsSync(this.script)) {
+        reject(new Error(`sim sidecar not found at ${this.script}`));
         return;
       }
-      if (!existsSync(this.opts.python)) {
-        reject(
-          new Error(
-            `sim python not found at ${this.opts.python} — run sim/setup.sh ` +
-              `(or set DUCK_SIM_PYTHON)`,
-          ),
-        );
+      if (!existsSync(this.python)) {
+        reject(new Error(`sim python not found at ${this.python} — run sim/setup.sh (or set DUCK_SIM_PYTHON)`));
         return;
       }
-      const proc = spawn(this.opts.python, [this.opts.script, ...this.opts.args], {
-        env: { MUJOCO_GL: "egl", ...process.env, ...this.opts.env },
+      const proc = spawn(this.python, [this.script, ...this.args], {
+        env: { MUJOCO_GL: "egl", ...process.env },
         stdio: ["pipe", "pipe", "pipe"],
       });
       this.proc = proc;
       const timer = setTimeout(
-        () => reject(new Error(`sim sidecar did not report ready within ${this.opts.readyTimeoutMs}ms`)),
-        this.opts.readyTimeoutMs,
+        () => reject(new Error(`sim sidecar did not report ready within ${this.readyTimeoutMs}ms`)),
+        this.readyTimeoutMs,
       );
+      const fail = (e: Error) => {
+        clearTimeout(timer);
+        this.exited = e;
+        reject(e);
+        this.failAll(e);
+      };
 
       createInterface({ input: proc.stdout }).on("line", (line) => {
-        let msg: {
-          id?: number | null;
-          method?: string;
-          params?: Record<string, unknown>;
-          result?: unknown;
-          error?: { code: number; message: string };
-        };
+        let msg: SidecarMessage;
         try {
           msg = JSON.parse(line);
         } catch {
           console.error(`[sim] unparseable line: ${line}`);
           return;
         }
-        if (msg.method === "sim.ready") {
-          clearTimeout(timer);
-          console.error(`[sim] ready: ${JSON.stringify(msg.params)}`);
-          resolve();
+        if ("method" in msg) {
+          if (msg.method === "sim.ready") {
+            clearTimeout(timer);
+            console.error(`[sim] ready: ${JSON.stringify(msg.params)}`);
+            resolve();
+          } else if (msg.method === "sim.error") {
+            clearTimeout(timer);
+            reject(new Error(String(msg.params?.message ?? "sim error")));
+          }
           return;
         }
-        if (msg.method === "sim.error") {
-          clearTimeout(timer);
-          reject(new Error(String(msg.params?.message ?? "sim error")));
-          return;
-        }
-        if (typeof msg.id !== "number") return;
         const p = this.pending.get(msg.id);
         if (!p) return;
         this.pending.delete(msg.id);
         clearTimeout(p.timer);
-        if (msg.error) p.reject(new Error(`${msg.error.message} (code ${msg.error.code})`));
+        if (msg.error) p.reject(new Error(rpcErrorMessage(msg.error)));
         else p.resolve(msg.result);
       });
       createInterface({ input: proc.stderr }).on("line", (l) => console.error(`[sim] ${l}`));
-      proc.on("error", (e) => {
-        clearTimeout(timer);
-        this.exited = e;
-        reject(e);
-        this.failAll(e);
-      });
-      proc.on("exit", (code, signal) => {
-        const e = new Error(`sim sidecar exited (code ${code}, signal ${signal})`);
-        this.exited = e;
-        clearTimeout(timer);
-        reject(e);
-        this.failAll(e);
-      });
+      proc.on("error", fail);
+      proc.on("exit", (code, signal) => fail(new Error(`sim sidecar exited (code ${code}, signal ${signal})`)));
     });
     return this.ready;
   }
@@ -146,16 +141,11 @@ export class SimTransport implements DuckTransport {
     }
   }
 
-  async call(
-    _service: DuckService,
-    method: string,
-    params?: Record<string, unknown>,
-    timeoutMs = method === "sim.camera" ? 30_000 : this.opts.callTimeoutMs,
-  ): Promise<unknown> {
+  private async send(method: string, params: Record<string, unknown> | undefined, timeoutMs: number): Promise<unknown> {
     await this.start();
     if (this.exited) throw this.exited;
     const id = this.nextId++;
-    const req = { jsonrpc: "2.0", id, method, params: params ?? {} };
+    const req: JsonRpcRequest = { jsonrpc: "2.0", id, method, params: params ?? {} };
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -172,13 +162,16 @@ export class SimTransport implements DuckTransport {
     });
   }
 
-  async ping(): Promise<boolean> {
-    try {
-      await this.call("robotd", "robot.health");
-      return true;
-    } catch {
-      return false;
-    }
+  call(_service: DuckService, method: string, params?: Record<string, unknown>): Promise<unknown> {
+    return this.send(method, params, this.callTimeoutMs);
+  }
+
+  snapshot(req: SnapshotRequest): Promise<Snapshot> {
+    return this.send("sim.camera", { ...req }, SNAPSHOT_TIMEOUT_MS) as Promise<Snapshot>;
+  }
+
+  ping(): Promise<boolean> {
+    return pingViaHealth(this);
   }
 
   async close(): Promise<void> {

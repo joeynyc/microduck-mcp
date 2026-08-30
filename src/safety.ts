@@ -18,7 +18,34 @@ export const LIMITS = {
   motionCooldownMs: 250,
 } as const;
 
+/**
+ * How each behavior is gated. "motion" = full preMotionCheck; "recovery" =
+ * preMotionCheck with allowUnhealthy (a fallen robot is unhealthy by
+ * definition, and refusing the one command that fixes that would strand it);
+ * "none" = never gated. The tool enum is derived from this table so adding a
+ * behavior is one edit.
+ */
+export const BEHAVIOR_GATES = {
+  sit: "motion",
+  stand: "motion",
+  getup: "recovery",
+  pickup: "motion",
+  kick: "motion",
+  roulade: "motion",
+  quack: "none",
+} as const;
+export type Behavior = keyof typeof BEHAVIOR_GATES;
+export const BEHAVIORS = Object.keys(BEHAVIOR_GATES) as [Behavior, ...Behavior[]];
+
+export async function preBehaviorCheck(t: DuckTransport, name: Behavior): Promise<void> {
+  const gate = BEHAVIOR_GATES[name];
+  if (gate === "none") return;
+  await preMotionCheck(t, { allowUnhealthy: gate === "recovery" });
+}
+
 let lastMotionAt = 0;
+/** Bumped by stopWalk(); an in-flight walk() ends when it changes. */
+let walkEpoch = 0;
 
 /** Clear the motion cooldown. Intended for tests; never call from a tool. */
 export function resetMotionCooldown(): void {
@@ -32,6 +59,40 @@ export function clampVelocity(vx: number, vy: number, wz: number) {
     vy: clamp(vy, LIMITS.maxLinearVelocity),
     wz: clamp(wz, LIMITS.maxYawRate),
   };
+}
+
+/**
+ * Drive a velocity intent for `durationS`, transport-independently: robotd's
+ * `robot.move` is a notification whose expiry is the deadman, so a walk of
+ * any length is a stream of intents followed by a stop. Re-sends every
+ * `intervalMs`, then sends robot.stop. Returns early if stopWalk() is called
+ * (duck_stop) or the transport refuses an intent (fallen, unreachable).
+ */
+export async function walk(
+  t: DuckTransport,
+  v: { vx: number; vy: number; wz: number },
+  durationS: number,
+  intervalMs = 250,
+): Promise<{ applied: unknown; duration_s: number; interrupted: boolean }> {
+  const epoch = ++walkEpoch;
+  const applied = await t.call("robotd", "robot.intent", v);
+  const until = Date.now() + durationS * 1000;
+  let interrupted = false;
+  while (Date.now() < until) {
+    await new Promise((r) => setTimeout(r, Math.min(intervalMs, until - Date.now())));
+    if (walkEpoch !== epoch) {
+      interrupted = true;
+      break;
+    }
+    if (Date.now() < until) await t.call("robotd", "robot.intent", v);
+  }
+  if (!interrupted) await t.call("robotd", "robot.stop");
+  return { applied, duration_s: durationS, interrupted };
+}
+
+/** End any in-flight walk() loop. duck_stop calls this before robot.stop. */
+export function stopWalk(): void {
+  walkEpoch++;
 }
 
 /**

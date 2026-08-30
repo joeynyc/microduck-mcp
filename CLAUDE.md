@@ -129,7 +129,15 @@ ported verbatim in `sim/duck_sim.py` with line-level provenance.
 ## Conventions
 
 - TypeScript strict, ESM, Node16 module resolution. `npm run build` must pass.
-- Every motion tool goes through `preMotionCheck`. No exceptions except
-  `duck_stop` and `quack`; `getup` passes `allowUnhealthy` (battery + rate
-  limit still apply).
+- Every motion tool goes through `preMotionCheck`. `duck_stop` is never
+  gated. Behaviors are gated by the `BEHAVIOR_GATES` table in `safety.ts`
+  (quack: none; getup: recovery = allowUnhealthy, battery + rate limit still
+  apply); the tool enum derives from that table — add behaviors there.
+- `duck_walk` is transport-independent: `walk()` in `safety.ts` re-sends the
+  intent every 250 ms for `duration_s` then sends `robot.stop`, because
+  upstream's `robot.move` is a deadman-stamped notification. `duck_stop`
+  interrupts it via `stopWalk()`.
+- Camera is a transport *capability* (`DuckTransport.snapshot?`), not an RPC
+  name: sim renders, mock returns a placeholder, unix/ssh have none until
+  mediad is wired.
 - Tool descriptions state their safety behavior explicitly (agents read them).

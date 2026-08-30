@@ -23,7 +23,6 @@ const tools = (await client.listTools()).tools.map((t) => t.name);
 console.log("tools:", tools.join(", "), "\n");
 
 const outDir = process.env.DUCK_DEMO_OUT ?? join(root, "demo-out");
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let frames = 0;
 
 async function call(name, args = {}) {
@@ -43,8 +42,7 @@ async function call(name, args = {}) {
 
 const sim = process.env.DUCK_TRANSPORT === "sim";
 await call("duck_health");
-await call("duck_walk", { vx: 0.25, duration_s: sim ? 4 : 2 });
-await sleep(sim ? 4200 : 400);
+await call("duck_walk", { vx: 0.25, duration_s: sim ? 4 : 1 }); // blocks until the walk ends
 await call("duck_monitor");
 await call("duck_camera", { view: "follow" });
 if (sim) await call("duck_camera", { view: "head" });

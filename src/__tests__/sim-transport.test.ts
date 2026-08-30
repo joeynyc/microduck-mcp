@@ -1,42 +1,18 @@
-import { test, describe, after } from "node:test";
+import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { SimTransport } from "../transport/sim.js";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { SimTransport, SimTransportOptions } from "../transport/sim.js";
 
 /**
- * Contract tests for SimTransport against a fake sidecar written in Node, so
- * they run without MuJoCo. The fake speaks the same line-delimited JSON-RPC
- * the Python sidecar does: a `sim.ready` notification, then answers.
+ * Contract tests for SimTransport against `fixtures/fake_sidecar.mjs`, a Node
+ * stand-in that speaks the sidecar's line-delimited JSON-RPC without MuJoCo.
  */
-const dir = mkdtempSync(join(tmpdir(), "duck-sim-test-"));
-const fake = join(dir, "fake_sidecar.mjs");
-writeFileSync(
-  fake,
-  `
-import { createInterface } from "node:readline";
-const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
-const mode = process.argv[2] ?? "ok";
-if (mode === "crash") process.exit(3);
-if (mode === "missing-assets") { send({ jsonrpc: "2.0", method: "sim.error", params: { message: "assets missing" } }); process.exit(2); }
-if (mode !== "never-ready") send({ jsonrpc: "2.0", method: "sim.ready", params: { policies: ["walk"], hz: 50 } });
-process.stderr.write("fake sidecar up\\n");
-createInterface({ input: process.stdin }).on("line", (line) => {
-  const req = JSON.parse(line);
-  const { id, method, params } = req;
-  if (method === "robot.health") return send({ jsonrpc: "2.0", id, result: { healthy: true, mode: "standing", battery: { fraction: 0.8 } } });
-  if (method === "robot.intent") return send({ jsonrpc: "2.0", id, result: { applied: params, ttl_s: params.ttl_s ?? 2 } });
-  if (method === "slow") return; // never answers
-  if (method === "sim.camera") return send({ jsonrpc: "2.0", id, result: { png_base64: "iVBORw0KGgo=", width: 1, height: 1 } });
-  send({ jsonrpc: "2.0", id, error: { code: -32601, message: "method not found: " + method } });
-});
-`,
-);
-after(() => rmSync(dir, { recursive: true, force: true }));
+const fake = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "src", "__tests__", "fixtures", "fake_sidecar.mjs");
 
-const make = (mode = "ok", extra: Partial<ConstructorParameters<typeof SimTransport>[0]> = {}) =>
-  new SimTransport({
+/** Run `fn` against a fresh transport in the given fake mode; always closes it. */
+async function withSim(mode: string, fn: (t: SimTransport) => Promise<void>, extra: SimTransportOptions = {}) {
+  const t = new SimTransport({
     python: process.execPath,
     script: fake,
     args: [mode],
@@ -44,22 +20,23 @@ const make = (mode = "ok", extra: Partial<ConstructorParameters<typeof SimTransp
     callTimeoutMs: 500,
     ...extra,
   });
+  try {
+    await fn(t);
+  } finally {
+    await t.close();
+  }
+}
 
 describe("SimTransport", () => {
-  test("waits for sim.ready, then round-trips a call with id matching", async () => {
-    const t = make();
-    try {
+  test("waits for sim.ready, then round-trips a call with id matching", () =>
+    withSim("ok", async (t) => {
       const h = (await t.call("robotd", "robot.health")) as { healthy: boolean };
       assert.equal(h.healthy, true);
       assert.equal(await t.ping(), true);
-    } finally {
-      await t.close();
-    }
-  });
+    }));
 
-  test("passes params through and keeps concurrent calls straight", async () => {
-    const t = make();
-    try {
+  test("passes params through and keeps concurrent calls straight", () =>
+    withSim("ok", async (t) => {
       const [a, b, c] = await Promise.all([
         t.call("robotd", "robot.intent", { vx: 0.1 }),
         t.call("robotd", "robot.health"),
@@ -68,61 +45,49 @@ describe("SimTransport", () => {
       assert.deepEqual((a as any).applied, { vx: 0.1 });
       assert.equal((b as any).mode, "standing");
       assert.equal((c as any).ttl_s, 5);
-    } finally {
-      await t.close();
-    }
-  });
+    }));
 
-  test("maps JSON-RPC errors to rejections with the message", async () => {
-    const t = make();
-    try {
+  test("snapshot() is the sim.camera method with its own timeout", () =>
+    withSim("ok", async (t) => {
+      const s = await t.snapshot({ view: "head", width: 64, height: 48 });
+      assert.equal(s.png_base64, "iVBORw0KGgo=");
+      assert.equal(s.view, "head");
+      assert.equal(s.width, 64);
+    }));
+
+  test("maps JSON-RPC errors to rejections with the message", () =>
+    withSim("ok", async (t) => {
       await assert.rejects(() => t.call("robotd", "robot.nope"), /method not found: robot.nope/);
-    } finally {
-      await t.close();
-    }
-  });
+    }));
 
-  test("times out a call the sidecar never answers", async () => {
-    const t = make();
-    try {
+  test("times out a call the sidecar never answers, and stays usable", () =>
+    withSim("ok", async (t) => {
       await assert.rejects(() => t.call("robotd", "slow"), /timed out after 500ms/);
-      // and the transport is still usable afterwards
       assert.equal(await t.ping(), true);
-    } finally {
-      await t.close();
-    }
-  });
+    }));
 
-  test("rejects every call if the sidecar exits", async () => {
-    const t = make("crash");
-    try {
+  test("rejects every call if the sidecar exits", () =>
+    withSim("crash", async (t) => {
       await assert.rejects(() => t.call("robotd", "robot.health"), /exited \(code 3/);
       assert.equal(await t.ping(), false);
-    } finally {
-      await t.close();
-    }
-  });
+    }));
 
-  test("surfaces a sim.error (e.g. missing assets) as the startup failure", async () => {
-    const t = make("missing-assets");
-    try {
+  test("surfaces a sim.error (e.g. missing assets) as the startup failure", () =>
+    withSim("missing-assets", async (t) => {
       await assert.rejects(() => t.call("robotd", "robot.health"), /assets missing/);
-    } finally {
-      await t.close();
-    }
-  });
+    }));
 
-  test("fails fast when the sidecar never reports ready", async () => {
-    const t = make("never-ready", { readyTimeoutMs: 300 });
-    try {
-      await assert.rejects(() => t.call("robotd", "robot.health"), /did not report ready/);
-    } finally {
-      await t.close();
-    }
-  });
+  test("fails fast when the sidecar never reports ready", () =>
+    withSim(
+      "never-ready",
+      async (t) => {
+        await assert.rejects(() => t.call("robotd", "robot.health"), /did not report ready/);
+      },
+      { readyTimeoutMs: 300 },
+    ));
 
   test("fails with a helpful message when the python interpreter is missing", async () => {
-    const t = new SimTransport({ python: join(dir, "nope", "python"), script: fake });
+    const t = new SimTransport({ python: "/nonexistent/python", script: fake });
     await assert.rejects(() => t.call("robotd", "robot.health"), /run sim\/setup.sh/);
     await t.close();
   });

@@ -17,7 +17,15 @@ import { MockTransport } from "./transport/mock.js";
 import { UnixTransport } from "./transport/unix.js";
 import { SshTransport } from "./transport/ssh.js";
 import { SimTransport } from "./transport/sim.js";
-import { clampVelocity, preMotionCheck, LIMITS } from "./safety.js";
+import {
+  BEHAVIORS,
+  clampVelocity,
+  LIMITS,
+  preBehaviorCheck,
+  preMotionCheck,
+  stopWalk,
+  walk,
+} from "./safety.js";
 
 function pickTransport(): DuckTransport {
   switch (process.env.DUCK_TRANSPORT) {
@@ -138,11 +146,12 @@ server.registerTool(
     description:
       "Send a velocity intent: vx forward m/s, vy sideways m/s, wz yaw " +
       `rad/s. Values are clamped to ±${LIMITS.maxLinearVelocity} m/s linear ` +
-      `and ±${LIMITS.maxYawRate} rad/s yaw. The intent expires after ` +
-      "duration_s (default 2 s, max 10 s) — robotd's deadman zeroes velocity " +
-      "when intents stop arriving, so the duck stops on its own; it does not " +
-      "run away. Call duck_monitor afterwards to see how far it got. Refused " +
-      `below ${LIMITS.minBatteryForMotion * 100}% battery or when fallen.`,
+      `and ±${LIMITS.maxYawRate} rad/s yaw. Walks for duration_s (default ` +
+      "2 s, max 10 s) then stops; the call returns when the walk is over. " +
+      "duck_stop interrupts it at any time, and robotd's own deadman stops " +
+      "the duck if this server dies mid-walk — it does not run away. Call " +
+      "duck_monitor afterwards to see how far it got. Refused below " +
+      `${LIMITS.minBatteryForMotion * 100}% battery or when fallen.`,
     inputSchema: {
       vx: z.number().describe("Forward velocity, m/s. Negative = backward."),
       vy: z.number().default(0).describe("Sideways velocity, m/s."),
@@ -158,10 +167,7 @@ server.registerTool(
   async ({ vx, vy, wz, duration_s }) => {
     try {
       await preMotionCheck(duck);
-      const v = clampVelocity(vx, vy ?? 0, wz ?? 0);
-      return json(
-        await duck.call("robotd", "robot.intent", { ...v, ttl_s: duration_s ?? 2 }),
-      );
+      return json(await walk(duck, clampVelocity(vx, vy, wz), duration_s));
     } catch (e) {
       return fail(e);
     }
@@ -180,18 +186,12 @@ server.registerTool(
       "to see when 'busy' clears. Battery- and health-gated like walking " +
       "(quack is free).",
     inputSchema: {
-      name: z
-        .enum(["sit", "stand", "getup", "pickup", "kick", "roulade", "quack"])
-        .describe("Which behavior to run."),
+      name: z.enum(BEHAVIORS).describe("Which behavior to run."),
     },
   },
   async ({ name }) => {
     try {
-      // Quacking is free. getup is the recovery path and *must* be allowed
-      // while the robot reports unhealthy/fallen, so it skips the health gate
-      // but still runs the battery + rate checks.
-      if (name === "getup") await preMotionCheck(duck, { allowUnhealthy: true });
-      else if (name !== "quack") await preMotionCheck(duck);
+      await preBehaviorCheck(duck, name);
       return json(await duck.call("robotd", "robot.behavior", { name }));
     } catch (e) {
       return fail(e);
@@ -219,17 +219,12 @@ server.registerTool(
       height: z.number().int().min(48).max(480).default(240),
     },
   },
-  async ({ view, width, height }) => {
+  async (req) => {
     try {
-      const r = (await duck.call("robotd", "sim.camera", {
-        view: view ?? "follow",
-        width: width ?? 320,
-        height: height ?? 240,
-      })) as { png_base64?: string; width?: number; height?: number; note?: string };
-      if (!r?.png_base64) {
-        return fail(new Error("no frame available on this transport"));
+      if (!duck.snapshot) {
+        return fail(new Error(`no camera on the ${process.env.DUCK_TRANSPORT ?? "mock"} transport`));
       }
-      const { png_base64, ...meta } = r;
+      const { png_base64, ...meta } = await duck.snapshot(req);
       return {
         content: [
           { type: "image" as const, data: png_base64, mimeType: "image/png" },
@@ -254,6 +249,7 @@ server.registerTool(
   },
   async () => {
     try {
+      stopWalk();
       return json(await duck.call("robotd", "robot.stop"));
     } catch (e) {
       return fail(e);

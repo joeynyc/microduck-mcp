@@ -24,9 +24,7 @@ pose, 1.75 A current limit) follows `microduck_rl/scripts/infer_policy.py`
 1.0 and no low-pass — robotd wins: it is what the real robot runs, and
 CLAUDE.md says the doc that owns the mechanism wins.
 
-Methods (see `handle()`):
-    robot.health  robot.state  robot.intent|robot.move  robot.behavior|robot.do
-    robot.head    robot.stop   system.version  update.list  sim.camera  sim.reset
+Methods: see `METHODS` at the bottom.
 """
 from __future__ import annotations
 
@@ -40,6 +38,7 @@ import queue
 import sys
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -66,7 +65,6 @@ OBS_LEN, ACTION_LEN = 61, 14
 
 # robotd Tuning::default() / SkillTuning::default()
 ACTION_SCALE = 0.9
-STANDING_ACTION_SCALE = 1.0
 STANDING_GAIN_RATIO = 0.8
 HEAD_LOWPASS = 0.5
 LEGS_LOWPASS = 0.7
@@ -78,12 +76,15 @@ GROUND_PICK_END_PHASE = 0.7
 KICK_DURATION = 0.5
 ROULADE_DURATION = 1.0
 RISE_SECS = 1.0
+# Per-joint low-pass alpha, applied as one vector op per tick.
+LOWPASS = np.full(ACTION_LEN, LEGS_LOWPASS)
+LOWPASS[HEAD] = HEAD_LOWPASS
 
 # Velocity envelope the walking policy was trained on
 # (microduck_rl tasks/microduck_velocity_env_cfg.py:648-650). robotd clamps
 # to its own configured max and reports `limited_by: ["max_velocity"]`; we
 # do the same with the training envelope.
-MAX_VX, MAX_VY, MAX_VYAW = 0.4, 0.3, 1.0
+MAX_TWIST = np.array([0.4, 0.3, 1.0])  # vx, vy, vyaw
 
 # Battery: duck_control::model::battery_percent — 6.6 V empty, 8.2 V full.
 BATTERY_EMPTY_V, BATTERY_FULL_V = 6.6, 8.2
@@ -103,6 +104,13 @@ CURRENT_LIMIT_A = 1.75
 FALLEN_GZ = -0.5
 FALLEN_TICKS = 10
 
+# Camera. Sizes mirror the Zod bounds on duck_camera in src/index.ts; the
+# sidecar re-clamps because it cannot trust its caller. Each Renderer owns a
+# framebuffer, so the cache is bounded.
+CAM_W = (64, 640)
+CAM_H = (48, 480)
+MAX_RENDERERS = 2
+
 POLICY_FILES = {
     "walk": "alpha_walking.onnx",
     "stand": "alpha_stand.onnx",
@@ -113,11 +121,21 @@ POLICY_FILES = {
     "roulade": "roulade.onnx",
 }
 
+FALLEN_MSG = "refused: robot is fallen/limp; run behavior 'getup' first"
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def rounded(a, nd: int = 3) -> list[float]:
+    return [round(float(x), nd) for x in a]
+
 
 def battery_percent(volts: float) -> float:
     if not math.isfinite(volts) or volts <= 0:
         return 0.0
-    return max(0.0, min(1.0, (volts - BATTERY_EMPTY_V) / (BATTERY_FULL_V - BATTERY_EMPTY_V))) * 100.0
+    return clamp((volts - BATTERY_EMPTY_V) / (BATTERY_FULL_V - BATTERY_EMPTY_V), 0.0, 1.0) * 100.0
 
 
 def quat_rotate_inverse(q: np.ndarray, v: np.ndarray) -> np.ndarray:
@@ -132,6 +150,12 @@ def quat_yaw(q: np.ndarray) -> float:
     return math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
 
 
+class RpcError(Exception):
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code, self.message = code, message
+
+
 # --------------------------------------------------------------------------
 # The simulated robot
 # --------------------------------------------------------------------------
@@ -142,26 +166,27 @@ class DuckSim:
         import onnxruntime as ort
 
         self.mujoco = mujoco
-        self.model = mujoco.MjModel.from_xml_path(str(scene_xml))
-        self.data = mujoco.MjData(self.model)
-        self.model.opt.timestep = SIM_DT
+        m = self.model = mujoco.MjModel.from_xml_path(str(scene_xml))
+        self.data = mujoco.MjData(m)
+        m.opt.timestep = SIM_DT
 
-        names = [self.model.actuator(i).name for i in range(self.model.nu)]
+        names = [m.actuator(i).name for i in range(m.nu)]
         if names != JOINT_NAMES:
             raise RuntimeError(f"actuator order {names} != expected {JOINT_NAMES}")
-        self.qpos_idx = [int(self.model.jnt_qposadr[self.model.actuator_trnid[i, 0]]) for i in range(self.model.nu)]
-        self.qvel_idx = [int(self.model.jnt_dofadr[self.model.actuator_trnid[i, 0]]) for i in range(self.model.nu)]
-        self.trunk = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "trunk_base")
-        gyro = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "imu_ang_vel")
-        self.gyro_adr = int(self.model.sensor_adr[gyro])
-        free = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")
-        self.free_adr = int(self.model.jnt_qposadr[free])
+        self.qpos_idx = [int(m.jnt_qposadr[m.actuator_trnid[i, 0]]) for i in range(m.nu)]
+        self.qvel_idx = [int(m.jnt_dofadr[m.actuator_trnid[i, 0]]) for i in range(m.nu)]
+        self.trunk = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "trunk_base")
+        self.gyro_adr = int(m.sensor_adr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SENSOR, "imu_ang_vel")])
+        self.free_adr = int(m.jnt_qposadr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")])
+        self.head_cam = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_CAMERA, "head_camera")
 
         limit = XL330_M6_KT * CURRENT_LIMIT_A
-        self.model.actuator_forcerange[:] = [-limit, limit]
-        self.model.actuator_forcelimited[:] = 1
-        self.kp = self.model.actuator_gainprm[:, 0].copy()
+        m.actuator_forcerange[:] = [-limit, limit]
+        m.actuator_forcelimited[:] = 1
+        self.kp = m.actuator_gainprm[:, 0].copy()
+        self.gain_ratio = -1.0
 
+        # All nets load eagerly: a first-use load mid-skill would stall the loop.
         self.nets: dict[str, ort.InferenceSession] = {}
         for role, fname in POLICY_FILES.items():
             p = policy_dir / fname
@@ -171,14 +196,13 @@ class DuckSim:
                 if list(i.shape) != [1, OBS_LEN] or list(o.shape) != [1, ACTION_LEN]:
                     raise RuntimeError(f"{fname}: expected obs[1,{OBS_LEN}]→actions[1,{ACTION_LEN}], got {i.shape}→{o.shape}")
                 self.nets[role] = s
-        if "walk" not in self.nets:
-            raise RuntimeError(f"no walking policy at {policy_dir / POLICY_FILES['walk']}")
+        self.net("walk")
         self.in_name = self.nets["walk"].get_inputs()[0].name
         self.out_name = self.nets["walk"].get_outputs()[0].name
 
         self.battery_v = battery_v
         self.deadman_s = deadman_s
-        self.renderers: dict[tuple[int, int], object] = {}
+        self.renderers: OrderedDict[tuple[int, int], object] = OrderedDict()
         self.t0 = time.monotonic()
         self.reset()
 
@@ -196,10 +220,10 @@ class DuckSim:
         self.mujoco.mj_forward(m, d)
 
         self.last_action = np.zeros(ACTION_LEN, dtype=np.float32)
-        self.previous: np.ndarray | None = None
-        self.requested = np.zeros(3)      # what the caller asked for
-        self.target_twist = np.zeros(3)   # after envelope clamp
-        self.twist = np.zeros(3)          # after EMA
+        self.previous = DEFAULT_POSE.copy()   # low-pass state; starts from reality
+        self.requested = np.zeros(3)          # what the caller asked for (wire: move.requested)
+        self.target_twist = np.zeros(3)       # after envelope clamp, before EMA
+        self.twist = np.zeros(3)              # what the policy sees (wire: move.applied)
         self.limited_by: list[str] = []
         self.intent_at = -1e9
         self.intent_ttl = 0.0
@@ -208,48 +232,56 @@ class DuckSim:
         self.ground_pick: float | None = None
         self.kick: tuple[bool, float] | None = None
         self.roulade: float | None = None
-        self.sit = "up"                    # up | sitting | rising
+        self.sit = "up"                       # up | sitting | rising
         self.rise_left = 0.0
         self.fallen = False
         self.fall_ticks = 0
-        self.label = "walk"
-        self.tick_count = 0
+        self.label = "walk"                   # which net drove the last tick (wire: policy)
+        self.mode = "standing"                # agent-facing summary, set alongside label
         self.missed = 0
         self.hz_est = 1.0 / CONTROL_DT
-        self.enabled = True
 
     def _set_gain(self, ratio: float):
+        if ratio == self.gain_ratio:
+            return
+        self.gain_ratio = ratio
         self.model.actuator_gainprm[:, 0] = self.kp * ratio
         self.model.actuator_biasprm[:, 1] = -self.kp * ratio
 
     def now(self) -> float:
         return time.monotonic() - self.t0
 
+    def net(self, role: str) -> str:
+        if role not in self.nets:
+            raise RpcError(-32000, f"no {role} policy loaded")
+        return role
+
+    def require_upright(self):
+        if self.fallen:
+            raise RpcError(-32000, FALLEN_MSG)
+
     # ---- sensors ---------------------------------------------------------
 
     def gravity(self) -> np.ndarray:
-        q = self.data.xquat[self.trunk].copy()
-        return quat_rotate_inverse(q, np.array([0.0, 0.0, -1.0]))
+        return quat_rotate_inverse(self.data.xquat[self.trunk], np.array([0.0, 0.0, -1.0]))
 
     def gyro(self) -> np.ndarray:
-        return self.data.sensordata[self.gyro_adr:self.gyro_adr + 3].copy()
+        return self.data.sensordata[self.gyro_adr:self.gyro_adr + 3]
 
     def joint_pos(self) -> np.ndarray:
-        return self.data.qpos[self.qpos_idx].copy()
+        return self.data.qpos[self.qpos_idx]
 
     def joint_vel(self) -> np.ndarray:
-        return self.data.qvel[self.qvel_idx].copy()
+        return self.data.qvel[self.qvel_idx]
 
     def odom(self) -> dict:
-        p = self.data.xpos[self.trunk]
-        return {"x_m": round(float(p[0]), 4), "y_m": round(float(p[1]), 4), "z_m": round(float(p[2]), 4),
-                "yaw_rad": round(quat_yaw(self.data.xquat[self.trunk]), 4)}
+        x, y, z = rounded(self.data.xpos[self.trunk], 4)
+        return {"x_m": x, "y_m": y, "z_m": z, "yaw_rad": round(quat_yaw(self.data.xquat[self.trunk]), 4)}
 
     # ---- one 50 Hz tick: a port of robotd Controller::step ---------------
 
     def tick(self):
         dt = CONTROL_DT
-        self.tick_count += 1
 
         # Deadman: intents expire; robotd zeroes a stale slot the same way.
         if self.now() - self.intent_at > self.intent_ttl:
@@ -258,8 +290,8 @@ class DuckSim:
         self.head += HEAD_ALPHA * (self.head_target - self.head)
 
         # Fall detection → limp. Motion is refused until getup/reset.
-        gz = self.gravity()[2]
-        self.fall_ticks = self.fall_ticks + 1 if gz > FALLEN_GZ else 0
+        gravity = self.gravity()
+        self.fall_ticks = self.fall_ticks + 1 if gravity[2] > FALLEN_GZ else 0
         if self.fall_ticks >= FALLEN_TICKS and not self.fallen:
             self.fallen = True
             self._set_gain(0.0)
@@ -268,7 +300,7 @@ class DuckSim:
         if self.fallen:
             for _ in range(DECIMATION):
                 self.mujoco.mj_step(self.model, self.data)
-            self.label = "limp"
+            self.label, self.mode = "limp", "fallen"
             return
 
         # Expire windows first (control.rs).
@@ -279,62 +311,49 @@ class DuckSim:
         if self.sit == "rising" and self.rise_left <= 0:
             self.sit = "up"
 
+        # Re-encode the command for the active skill and pick the network.
         cmd = np.zeros(13, dtype=np.float32)
         cmd[3:7] = self.head
-        twist_mag = float(np.linalg.norm(self.twist))
         if self.roulade is not None:
-            net, label = "roulade", "roulade"
+            net = label = mode = "roulade"
             cmd[3:7] = 0.0
         elif self.kick:
-            net = "kick_left" if self.kick[0] else "kick_right"
-            label = net
+            net = label = mode = "kick_left" if self.kick[0] else "kick_right"
             cmd[3:7] = 0.0
         elif self.ground_pick is not None:
             a = 2 * math.pi * self.ground_pick
             cmd[0:3] = [math.cos(a), math.sin(a), 0.0]
             cmd[3:7] = 0.0
-            net, label = "ground_pick", "ground_pick"
+            net = label = mode = "ground_pick"
         elif self.sit == "sitting":
             cmd[0] = 1.0
-            net, label = "sitstand", "sit"
+            net, label, mode = "sitstand", "sit", "sitting"
         elif self.sit == "rising":
-            net, label = "sitstand", "rise"
+            net, label, mode = "sitstand", "rise", "rise"
         else:
             cmd[0:3] = self.twist
-            if "stand" in self.nets and twist_mag <= STANDING_THRESHOLD:
-                net, label = "stand", "stand"
-            else:
-                net, label = "walk", "walk"
+            standing = "stand" in self.nets and float(np.linalg.norm(self.twist)) <= STANDING_THRESHOLD
+            net = label = "stand" if standing else "walk"
+            mode = "standing" if standing else "walking"
 
         obs = np.concatenate([
-            self.gyro(), self.gravity(),
-            self.joint_pos() - DEFAULT_POSE, self.joint_vel(),
-            self.last_action, cmd,
+            self.gyro(), gravity, self.joint_pos() - DEFAULT_POSE, self.joint_vel(), self.last_action, cmd,
         ]).astype(np.float32).reshape(1, -1)
         action = self.nets[net].run([self.out_name], {self.in_name: obs})[0].squeeze(0).astype(np.float32)
-        self.last_action = action.copy()
+        self.last_action = action
 
-        eff_mag = float(np.linalg.norm(cmd[0:3]))
+        # Scale and gain follow the active state. "Standing tuning" applies to
+        # the standing net, and to kicks / sitstand when their *effective*
+        # command is inside the standing threshold (control.rs keeps this).
         standing_tuned = net == "stand" or (
-            net in ("kick_left", "kick_right", "sitstand") and "stand" in self.nets and eff_mag <= STANDING_THRESHOLD)
-        if net in ("roulade", "ground_pick"):
-            scale, gain = 1.0, 1.0
-        elif net == "sitstand":
-            scale, gain = 1.0, (STANDING_GAIN_RATIO if standing_tuned else 1.0)
-        elif standing_tuned:
-            scale, gain = STANDING_ACTION_SCALE, STANDING_GAIN_RATIO
-        else:
-            scale, gain = ACTION_SCALE, 1.0
+            net in ("kick_left", "kick_right", "sitstand")
+            and "stand" in self.nets and float(np.linalg.norm(cmd[0:3])) <= STANDING_THRESHOLD)
+        scale = ACTION_SCALE if net == "walk" else 1.0
+        gain = STANDING_GAIN_RATIO if standing_tuned else 1.0
 
-        targets = DEFAULT_POSE + scale * action.astype(np.float64)
-        if self.previous is not None:
-            t = targets.copy()
-            t[HEAD] = HEAD_LOWPASS * targets[HEAD] + (1 - HEAD_LOWPASS) * self.previous[HEAD]
-            legs = np.ones(ACTION_LEN, dtype=bool)
-            legs[HEAD] = False
-            t[legs] = LEGS_LOWPASS * targets[legs] + (1 - LEGS_LOWPASS) * self.previous[legs]
-            targets = t
-        self.previous = targets.copy()
+        targets = DEFAULT_POSE + scale * action
+        targets = LOWPASS * targets + (1 - LOWPASS) * self.previous
+        self.previous = targets
 
         self._set_gain(gain)
         self.data.ctrl[:] = targets
@@ -352,31 +371,22 @@ class DuckSim:
             self.roulade -= dt
         if self.sit == "rising":
             self.rise_left -= dt
-        self.label = label
+        self.label, self.mode = label, mode
 
     def busy(self) -> bool:
         return self.ground_pick is not None or self.kick is not None or self.roulade is not None or self.sit == "rising"
 
-    def mode(self) -> str:
-        if self.fallen:
-            return "fallen"
-        if self.sit == "sitting":
-            return "sitting"
-        if self.busy():
-            return self.label
-        return "walking" if self.label == "walk" and np.linalg.norm(self.twist) > STANDING_THRESHOLD else "standing"
-
     # ---- RPC handlers ------------------------------------------------------
 
-    def health(self) -> dict:
-        v = self.battery_v
-        pct = battery_percent(v)
+    def health(self, _p: dict) -> dict:
+        pct = battery_percent(self.battery_v)
         healthy = not self.fallen and self.hz_est >= 0.9 / CONTROL_DT
         out = {
             "healthy": healthy,
             "degraded": False,
-            "mode": self.mode(),
-            "battery": {"volts": round(v, 2), "percent": round(pct, 1), "fraction": round(pct / 100, 3)},
+            "mode": self.mode,
+            # volts + percent is upstream's Battery; fraction is what safety.ts reads.
+            "battery": {"volts": round(self.battery_v, 2), "percent": round(pct, 1), "fraction": round(pct / 100, 3)},
             "control_loop": {"hz": round(self.hz_est, 1), "missed": self.missed},
             "loop_hz": round(self.hz_est, 1),
             "policy": self.label,
@@ -389,47 +399,41 @@ class DuckSim:
             out["reason"] = f"control loop at {self.hz_est:.1f} Hz"
         return out
 
-    def state(self) -> dict:
+    def state(self, _p: dict) -> dict:
         pos, vel = self.joint_pos(), self.joint_vel()
-        g = self.gravity()
+        vx, vy, wz = rounded(self.target_twist)
         return {
             "t": round(self.now(), 3),
-            "mode": self.mode(),
+            "mode": self.mode,
             "policy": self.label,
-            "move": {"requested": [round(float(x), 3) for x in self.requested],
-                     "applied": [round(float(x), 3) for x in self.twist],
-                     "limited_by": list(self.limited_by)},
-            "head": [round(float(x), 3) for x in self.head],
-            "gravity": [round(float(x), 3) for x in g],
-            "gyro_rad_s": [round(float(x), 3) for x in self.gyro()],
+            "move": {"requested": rounded(self.requested), "applied": rounded(self.twist), "limited_by": list(self.limited_by)},
+            "head": rounded(self.head),
+            "gravity": rounded(self.gravity()),
+            "gyro_rad_s": rounded(self.gyro()),
             "joints": {n: {"pos_rad": round(float(pos[i]), 4), "vel_rad_s": round(float(vel[i]), 3)}
                        for i, n in enumerate(JOINT_NAMES)},
-            "targets": [round(float(x), 4) for x in self.data.ctrl],
+            "targets": rounded(self.data.ctrl, 4),
             "odometry": self.odom(),
-            "intent": {"vx": round(float(self.target_twist[0]), 3), "vy": round(float(self.target_twist[1]), 3),
-                       "wz": round(float(self.target_twist[2]), 3)},
+            "intent": {"vx": vx, "vy": vy, "wz": wz},
             "safety": {"fallen": self.fallen, "limp": self.fallen, "busy": self.busy()},
             "loop": {"hz": round(self.hz_est, 1), "missed": self.missed},
             "sim": True,
         }
 
     def intent(self, p: dict) -> dict:
-        vx = float(p.get("vx", 0.0))
-        vy = float(p.get("vy", 0.0))
-        wz = float(p.get("wz", p.get("vyaw", 0.0)))
-        if not all(math.isfinite(v) for v in (vx, vy, wz)):
+        req = np.array([float(p.get("vx", 0.0)), float(p.get("vy", 0.0)), float(p.get("wz", p.get("vyaw", 0.0)))])
+        if not np.all(np.isfinite(req)):
             raise RpcError(-32602, "non-finite velocity refused")
-        if self.fallen:
-            raise RpcError(-32000, "refused: robot is fallen/limp; run behavior 'getup' first")
-        self.requested[:] = [vx, vy, wz]
-        clamped = [max(-MAX_VX, min(MAX_VX, vx)), max(-MAX_VY, min(MAX_VY, vy)), max(-MAX_VYAW, min(MAX_VYAW, wz))]
-        self.limited_by = ["max_velocity"] if clamped != [vx, vy, wz] else []
+        self.require_upright()
+        clamped = np.clip(req, -MAX_TWIST, MAX_TWIST)
+        self.requested[:] = req
         self.target_twist[:] = clamped
+        self.limited_by = ["max_velocity"] if np.any(clamped != req) else []
         self.intent_at = self.now()
         self.intent_ttl = float(p.get("ttl_s", self.deadman_s))
-        return {"applied": {"vx": clamped[0], "vy": clamped[1], "wz": clamped[2]},
-                "clamped": bool(self.limited_by), "limited_by": self.limited_by,
-                "ttl_s": self.intent_ttl, "sim": True}
+        vx, vy, wz = (float(x) for x in clamped)
+        return {"applied": {"vx": vx, "vy": vy, "wz": wz}, "clamped": bool(self.limited_by),
+                "limited_by": self.limited_by, "ttl_s": self.intent_ttl, "sim": True}
 
     def head_cmd(self, p: dict) -> dict:
         for i, k in enumerate(("neck_pitch", "head_pitch", "head_yaw", "head_roll")):
@@ -439,121 +443,146 @@ class DuckSim:
 
     def behavior(self, p: dict) -> dict:
         name = str(p.get("name") or p.get("skill") or "")
-        note = None
+        started, note = True, None
         if name == "quack":
-            return {"behavior": "quack", "started": True, "note": "no speaker in sim", "sim": True}
-        if name == "getup":
+            note = "no speaker in sim"
+        elif name == "getup":
             # No stand-up policy in the vendored set and robotd has no getup skill
             # (fall → limp, a human picks it up). Sim stands in for the human.
             xy = self.data.xpos[self.trunk][:2].copy()
             self.reset()
             self.data.qpos[self.free_adr:self.free_adr + 2] = xy
             self.mujoco.mj_forward(self.model, self.data)
-            return {"behavior": "getup", "started": True, "note": "sim: teleported upright in place", "sim": True}
-        if self.fallen:
-            raise RpcError(-32000, "refused: robot is fallen/limp; run behavior 'getup' first")
-        if name in ("sit", "stand", "sit_toggle"):
-            if "sitstand" not in self.nets:
-                raise RpcError(-32000, "no sitstand policy loaded")
-            if name == "sit" and self.sit == "sitting":
-                return {"behavior": "sit", "started": False, "note": "already sitting", "sim": True}
-            if name == "stand" and self.sit == "up":
-                return {"behavior": "stand", "started": False, "note": "already standing", "sim": True}
-            if self.sit == "rising":
-                raise RpcError(-32000, "already standing up")
-            if self.sit == "up":
-                self.sit = "sitting"
-                self.target_twist[:] = 0.0
-            else:
-                self.sit, self.rise_left = "rising", RISE_SECS
-        elif name in ("pickup", "ground_pick"):
-            if "ground_pick" not in self.nets:
-                raise RpcError(-32000, "no ground-pick policy loaded")
-            if self.ground_pick is not None:
-                raise RpcError(-32000, "ground pick already running")
-            self.ground_pick = 0.0
-        elif name in ("kick", "kick_right", "kick_left"):
-            left = name == "kick_left"
-            role = "kick_left" if left else "kick_right"
-            if role not in self.nets:
-                raise RpcError(-32000, f"no {role} policy loaded")
-            if self.busy():
-                raise RpcError(-32000, "a scripted move is already running")
-            self.kick = (left, KICK_DURATION)
-            note = "kick is ball-blind; no ball in this scene"
-        elif name == "roulade":
-            if "roulade" not in self.nets:
-                raise RpcError(-32000, "no roulade policy loaded")
-            if self.ground_pick is not None:
-                raise RpcError(-32000, "a ground pick is running")
-            self.roulade = ROULADE_DURATION
+            note = "sim: teleported upright in place"
         else:
-            raise RpcError(-32602, f"unknown behavior {name!r}")
-        out = {"behavior": name, "started": True, "sim": True}
+            self.require_upright()
+            if name in ("sit", "stand", "sit_toggle"):
+                self.net("sitstand")
+                if name == "sit" and self.sit == "sitting":
+                    started, note = False, "already sitting"
+                elif name == "stand" and self.sit == "up":
+                    started, note = False, "already standing"
+                elif self.sit == "rising":
+                    raise RpcError(-32000, "already standing up")
+                elif self.sit == "up":
+                    self.sit = "sitting"
+                    self.target_twist[:] = 0.0
+                else:
+                    self.sit, self.rise_left = "rising", RISE_SECS
+            elif name in ("pickup", "ground_pick"):
+                self.net("ground_pick")
+                if self.ground_pick is not None:
+                    raise RpcError(-32000, "ground pick already running")
+                self.ground_pick = 0.0
+            elif name in ("kick", "kick_right", "kick_left"):
+                left = name == "kick_left"
+                self.net("kick_left" if left else "kick_right")
+                if self.busy():
+                    raise RpcError(-32000, "a scripted move is already running")
+                self.kick = (left, KICK_DURATION)
+                note = "kick is ball-blind; no ball in this scene"
+            elif name == "roulade":
+                self.net("roulade")
+                if self.ground_pick is not None:
+                    raise RpcError(-32000, "a ground pick is running")
+                self.roulade = ROULADE_DURATION
+            else:
+                raise RpcError(-32602, f"unknown behavior {name!r}")
+        out = {"behavior": name, "started": started, "sim": True}
         if note:
             out["note"] = note
         return out
 
-    def stop(self) -> dict:
+    def stop(self, _p: dict) -> dict:
         self.target_twist[:] = 0.0
         self.requested[:] = 0.0
         self.intent_at = -1e9
         self.kick = self.roulade = self.ground_pick = None
         return {"stopped": True, "sim": True}
 
+    def sim_reset(self, _p: dict) -> dict:
+        self.reset()
+        return {"reset": True, "sim": True}
+
     def camera(self, p: dict) -> dict:
-        import mujoco
+        # Runs on the loop thread (the GL context lives here): one frame costs
+        # roughly half a tick, so a camera call may bump `missed` by one.
+        mujoco = self.mujoco
         from PIL import Image
-        w = int(p.get("width", 320))
-        h = int(p.get("height", 240))
-        w, h = max(64, min(640, w)), max(48, min(480, h))
+        w = int(clamp(int(p.get("width", 320)), *CAM_W))
+        h = int(clamp(int(p.get("height", 240)), *CAM_H))
         view = str(p.get("view", "follow"))
-        key = (w, h)
-        if key not in self.renderers:
-            self.renderers[key] = mujoco.Renderer(self.model, h, w)
-        r = self.renderers[key]
+
+        cam = mujoco.MjvCamera()
+        cam.type = mujoco.mjtCamera.mjCAMERA_FREE
         if view == "head":
             # The MJCF `head_camera` sits inside the head shell and its quat
             # points MuJoCo's optical axis (−z) *into* the head — upstream never
-            # renders from it. So take its world pose, look along +z (the
-            # lens direction: forward and ~14° down, the pickup view), and
-            # start 5 cm out so the shell isn't in frame.
-            cid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "head_camera")
-            pos = self.data.cam_xpos[cid]
-            d = self.data.cam_xmat[cid].reshape(3, 3)[:, 2]
-            eye = pos + 0.05 * d
-            cam = mujoco.MjvCamera()
-            cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+            # renders from it. So take its world pose, look along +z (the lens
+            # direction: forward and ~14° down, the pickup view), start 5 cm out
+            # so the shell isn't in frame, and keep its field of view.
+            d = self.data.cam_xmat[self.head_cam].reshape(3, 3)[:, 2]
+            eye = self.data.cam_xpos[self.head_cam] + 0.05 * d
             cam.lookat[:] = eye + d
             cam.distance = 1.0
             cam.azimuth = math.degrees(math.atan2(d[1], d[0]))
-            cam.elevation = math.degrees(math.asin(max(-1.0, min(1.0, float(d[2])))))
-            r.update_scene(self.data, camera=cam)
+            cam.elevation = math.degrees(math.asin(clamp(float(d[2]), -1.0, 1.0)))
+            fovy = float(self.model.cam_fovy[self.head_cam])
         else:
-            cam = mujoco.MjvCamera()
-            cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-            cam.lookat[:] = self.data.xpos[self.trunk]
-            cam.distance = float(p.get("distance", 0.8))
-            yaw_deg = math.degrees(quat_yaw(self.data.xquat[self.trunk]))
-            # MuJoCo free camera sits at lookat − distance·forward(az, el), so
+            # Free camera sits at lookat − distance·forward(az, el), so
             # azimuth == robot yaw puts it behind the robot, looking forward.
-            presets = {"follow": (yaw_deg, -20), "front": (yaw_deg + 180, -10),
-                       "side": (yaw_deg + 90, -10), "top": (yaw_deg, -89)}
+            yaw = math.degrees(quat_yaw(self.data.xquat[self.trunk]))
+            presets = {"follow": (yaw, -20), "front": (yaw + 180, -10), "side": (yaw + 90, -10), "top": (yaw, -89)}
             if view not in presets:
                 raise RpcError(-32602, f"unknown view {view!r}; use head|follow|front|side|top")
+            cam.lookat[:] = self.data.xpos[self.trunk]
+            cam.distance = float(p.get("distance", 0.8))
             cam.azimuth, cam.elevation = presets[view]
+            fovy = float(self.model.vis.global_.fovy)
+
+        key = (w, h)
+        if key not in self.renderers:
+            if len(self.renderers) >= MAX_RENDERERS:
+                self.renderers.popitem(last=False)
+            self.renderers[key] = mujoco.Renderer(self.model, h, w)
+        self.renderers.move_to_end(key)
+        r = self.renderers[key]
+        saved = self.model.vis.global_.fovy
+        self.model.vis.global_.fovy = fovy
+        try:
             r.update_scene(self.data, camera=cam)
-        img = r.render()
+        finally:
+            self.model.vis.global_.fovy = saved
         buf = io.BytesIO()
-        Image.fromarray(img).save(buf, format="PNG")
+        Image.fromarray(r.render()).save(buf, format="PNG")
         return {"png_base64": base64.b64encode(buf.getvalue()).decode("ascii"),
                 "width": w, "height": h, "view": view, "t": round(self.now(), 3), "sim": True}
 
+    def version(self, _p: dict) -> dict:
+        return {"release": "sim", "daemons": {"robotd": "duck_sim.py"}, "policies": sorted(self.nets), "sim": True}
 
-class RpcError(Exception):
-    def __init__(self, code: int, message: str):
-        super().__init__(message)
-        self.code, self.message = code, message
+    def updates(self, _p: dict) -> dict:
+        return {"current": "sim", "installed": ["sim"], "sim": True}
+
+
+# Wire methods → handlers. `robot.intent` / `robot.behavior` are this repo's
+# provisional names; `robot.move` / `robot.do` are upstream's (CLAUDE.md
+# mapping table). Delete the provisional aliases once unix.ts/ssh.ts send
+# upstream's names.
+METHODS = {
+    "robot.health": DuckSim.health,
+    "robot.state": DuckSim.state,
+    "robot.intent": DuckSim.intent,
+    "robot.move": DuckSim.intent,
+    "robot.behavior": DuckSim.behavior,
+    "robot.do": DuckSim.behavior,
+    "robot.head": DuckSim.head_cmd,
+    "robot.stop": DuckSim.stop,
+    "sim.camera": DuckSim.camera,
+    "sim.reset": DuckSim.sim_reset,
+    "system.version": DuckSim.version,
+    "update.list": DuckSim.updates,
+}
 
 
 # --------------------------------------------------------------------------
@@ -598,32 +627,26 @@ def main():
 
     threading.Thread(target=reader, daemon=True).start()
 
-    def handle(method: str, params: dict):
-        if method == "robot.health":
-            return sim.health()
-        if method == "robot.state":
-            return sim.state()
-        if method in ("robot.intent", "robot.move"):
-            return sim.intent(params)
-        if method in ("robot.behavior", "robot.do"):
-            return sim.behavior(params)
-        if method == "robot.head":
-            return sim.head_cmd(params)
-        if method == "robot.stop":
-            return sim.stop()
-        if method == "robot.enable":
-            sim.enabled = bool(params.get("on", True))
-            return {"enabled": sim.enabled, "sim": True}
-        if method == "sim.camera":
-            return sim.camera(params)
-        if method == "sim.reset":
-            sim.reset()
-            return {"reset": True, "sim": True}
-        if method == "system.version":
-            return {"release": "sim", "daemons": {"robotd": "duck_sim.py"}, "policies": sorted(sim.nets), "sim": True}
-        if method == "update.list":
-            return {"current": "sim", "installed": ["sim"], "sim": True}
-        raise RpcError(-32601, f"method not found: {method}")
+    def serve(line: str):
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError:
+            send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+            return
+        rid, method = req.get("id"), str(req.get("method"))
+        try:
+            handler = METHODS.get(method)
+            if handler is None:
+                raise RpcError(-32601, f"method not found: {method}")
+            result = handler(sim, req.get("params") or {})
+            if rid is not None:
+                send({"jsonrpc": "2.0", "id": rid, "result": result})
+        except RpcError as e:
+            if rid is not None:
+                send({"jsonrpc": "2.0", "id": rid, "error": {"code": e.code, "message": e.message}})
+        except Exception as e:  # noqa: BLE001
+            if rid is not None:
+                send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": f"{type(e).__name__}: {e}"}})
 
     next_tick = time.monotonic()
     last_tick = next_tick
@@ -636,22 +659,7 @@ def main():
                 break
             if line is None:
                 return
-            try:
-                req = json.loads(line)
-            except json.JSONDecodeError:
-                send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
-                continue
-            rid = req.get("id")
-            try:
-                result = handle(str(req.get("method")), req.get("params") or {})
-                if rid is not None:
-                    send({"jsonrpc": "2.0", "id": rid, "result": result})
-            except RpcError as e:
-                if rid is not None:
-                    send({"jsonrpc": "2.0", "id": rid, "error": {"code": e.code, "message": e.message}})
-            except Exception as e:  # noqa: BLE001
-                if rid is not None:
-                    send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": f"{type(e).__name__}: {e}"}})
+            serve(line)
 
         sim.tick()
         now = time.monotonic()

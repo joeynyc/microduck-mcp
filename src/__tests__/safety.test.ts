@@ -1,10 +1,14 @@
 import { test, describe, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import {
+  BEHAVIORS,
   clampVelocity,
+  LIMITS,
+  preBehaviorCheck,
   preMotionCheck,
   resetMotionCooldown,
-  LIMITS,
+  stopWalk,
+  walk,
 } from "../safety.js";
 import { DuckService, DuckTransport } from "../transport/types.js";
 
@@ -124,5 +128,62 @@ describe("preMotionCheck", () => {
       async close() {},
     };
     await assert.rejects(() => preMotionCheck(t), /ECONNREFUSED/);
+  });
+});
+
+describe("preBehaviorCheck", () => {
+  beforeEach(() => resetMotionCooldown());
+
+  test("quack is never gated", async () => {
+    await preBehaviorCheck(stub({ healthy: false, battery: { fraction: 0.01 } }), "quack");
+  });
+
+  test("getup is allowed on a fallen robot, but not on an empty battery", async () => {
+    await preBehaviorCheck(stub({ ...OK, healthy: false, mode: "fallen" }), "getup");
+    resetMotionCooldown();
+    await assert.rejects(() => preBehaviorCheck(stub({ healthy: false, battery: { fraction: 0.05 } }), "getup"), /Battery/);
+  });
+
+  test("every other behavior is fully gated", async () => {
+    for (const b of BEHAVIORS.filter((b) => b !== "quack" && b !== "getup")) {
+      resetMotionCooldown();
+      await assert.rejects(() => preBehaviorCheck(stub({ ...OK, healthy: false }), b), /unhealthy/);
+    }
+  });
+});
+
+describe("walk", () => {
+  test("re-sends the intent for the duration, then stops", async () => {
+    const t = stub(OK);
+    const r = await walk(t, { vx: 0.1, vy: 0, wz: 0 }, 0.25, 50);
+    const intents = t.calls.filter((c) => c === "robot.intent").length;
+    assert.ok(intents >= 3 && intents <= 7, `expected ~5 intents, got ${intents}`);
+    assert.equal(t.calls.at(-1), "robot.stop");
+    assert.equal(r.interrupted, false);
+    assert.equal(r.duration_s, 0.25);
+  });
+
+  test("stopWalk() interrupts an in-flight walk and leaves the stop to the caller", async () => {
+    const t = stub(OK);
+    const p = walk(t, { vx: 0.1, vy: 0, wz: 0 }, 5, 20);
+    await new Promise((r) => setTimeout(r, 60));
+    stopWalk();
+    const r = await p;
+    assert.equal(r.interrupted, true);
+    assert.ok(!t.calls.includes("robot.stop"), "duck_stop sends robot.stop itself");
+    assert.ok(t.calls.length < 10, "did not keep walking after stopWalk");
+  });
+
+  test("a refused intent aborts the walk", async () => {
+    const t: DuckTransport = {
+      async call() {
+        throw new Error("refused: robot is fallen/limp");
+      },
+      async ping() {
+        return true;
+      },
+      async close() {},
+    };
+    await assert.rejects(() => walk(t, { vx: 0.1, vy: 0, wz: 0 }, 1), /fallen/);
   });
 });

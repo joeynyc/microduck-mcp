@@ -1,4 +1,4 @@
-import { DuckService, DuckTransport } from "./types.js";
+import { DuckService, DuckTransport, Snapshot, SnapshotRequest } from "./types.js";
 
 /** 8×6 duck-yellow PNG, so duck_camera returns a valid image on mock. */
 const MOCK_PNG =
@@ -47,6 +47,7 @@ export class MockTransport implements DuckTransport {
           mock: true,
         };
       case "robot.intent": {
+        this.integrate();
         const vx = Number(params?.vx ?? 0);
         const vy = Number(params?.vy ?? 0);
         const wz = Number(params?.wz ?? 0);
@@ -62,19 +63,13 @@ export class MockTransport implements DuckTransport {
         return { behavior: b, started: true, mock: true };
       }
       case "robot.stop":
+        this.integrate();
         this.mode = "standing";
         this.vel = { vx: 0, vy: 0, wz: 0 };
         return { stopped: true, mock: true };
       case "robot.state": {
-        // One-shot sample: joints, gravity vector, odometry. Integrates the
-        // last velocity intent so the odometry visibly moves in demos.
-        const dt = (Date.now() - this.lastSampleAt) / 1000;
-        this.lastSampleAt = Date.now();
-        if (this.mode === "walking") {
-          this.odom.x += this.vel.vx * dt;
-          this.odom.y += this.vel.vy * dt;
-          this.odom.yaw += this.vel.wz * dt;
-        }
+        // One-shot sample: joints, gravity vector, odometry.
+        this.integrate();
         const walking = this.mode === "walking";
         const phase = (Date.now() / 400) % (2 * Math.PI);
         const gait = walking ? 0.15 * Math.sin(phase) : 0;
@@ -112,15 +107,6 @@ export class MockTransport implements DuckTransport {
           daemons: { robotd: "0.9.3", configd: "0.9.3", updaterd: "0.9.3" },
           mock: true,
         };
-      case "sim.camera":
-        return {
-          png_base64: MOCK_PNG,
-          width: 8,
-          height: 6,
-          view: params?.view ?? "follow",
-          note: "mock transport — placeholder frame. Use DUCK_TRANSPORT=sim for a rendered view.",
-          mock: true,
-        };
       case "update.list":
         return {
           current: "0.9.3-mock",
@@ -129,6 +115,27 @@ export class MockTransport implements DuckTransport {
         };
       default:
         return { method, params, note: "mock echo — no handler", mock: true };
+    }
+  }
+
+  async snapshot(req: SnapshotRequest): Promise<Snapshot> {
+    return {
+      png_base64: MOCK_PNG,
+      width: 8,
+      height: 6,
+      view: req.view,
+      note: "mock transport — placeholder frame. Use DUCK_TRANSPORT=sim for a rendered view.",
+    };
+  }
+
+  /** Advance odometry by the last intent since the previous sample, so it visibly moves in demos. */
+  private integrate(): void {
+    const dt = (Date.now() - this.lastSampleAt) / 1000;
+    this.lastSampleAt = Date.now();
+    if (this.mode === "walking") {
+      this.odom.x += this.vel.vx * dt;
+      this.odom.y += this.vel.vy * dt;
+      this.odom.yaw += this.vel.wz * dt;
     }
   }
 
