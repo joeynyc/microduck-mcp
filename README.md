@@ -113,4 +113,4 @@ Pre-hardware. Every transport speaks upstream's published wire protocol
 validated end to end, the `unix`/`ssh` paths against a fake daemon only —
 first contact with a real duck is ~Dec 2026.
 
-Apache-2.0-friendly; upstream robot software is Apache 2.0.
+Licensed under Apache-2.0 (see LICENSE); upstream robot software is Apache 2.0 too.

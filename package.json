@@ -2,16 +2,6 @@
   "name": "microduck-mcp",
   "version": "0.1.0",
   "description": "Agent-agnostic MCP server for the Pollen Robotics Microduck \u2014 by MicroduckHub",
-  "main": "index.js",
-  "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "tsc && node dist/index.js",
-    "test": "tsc && node --test \"dist/**/*.test.js\"",
-    "demo": "tsc && node scripts/demo.mjs",
-    "record-demo": "node scripts/record-demo.mjs demo-rec",
-    "compose-demo": "sim/.venv/bin/python scripts/compose-demo.py demo-rec"
-  },
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -20,8 +10,43 @@
     "robot",
     "microduckhub"
   ],
-  "author": "",
-  "license": "ISC",
+  "homepage": "https://microduckhub.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/joeynyc/microduck-mcp.git"
+  },
+  "license": "Apache-2.0",
+  "author": "joeynyc (https://microduckhub.com)",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "microduck-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "!dist/__tests__",
+    "sim/duck_sim.py",
+    "sim/setup.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js",
+    "test": "tsc && node --test \"dist/**/*.test.js\"",
+    "demo": "tsc && node scripts/demo.mjs",
+    "record-demo": "node scripts/record-demo.mjs demo-rec",
+    "compose-demo": "sim/.venv/bin/python scripts/compose-demo.py demo-rec",
+    "prepublishOnly": "npm run build && node --test \"dist/**/*.test.js\""
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
     "zod": "^4.5.4"
@@ -29,14 +54,5 @@
   "devDependencies": {
     "@types/node": "^26.4.0",
     "typescript": "^7.0.2"
-  },
-  "type": "module",
-  "bin": {
-    "microduck-mcp": "dist/index.js"
-  },
-  "homepage": "https://microduckhub.com",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/joeynyc/microduck-mcp.git"
   }
 }
