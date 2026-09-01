@@ -3,7 +3,7 @@ import { createInterface } from "node:readline";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { M, RobotState } from "./protocol.js";
+import { M, POLICY_SLOTS, RobotState } from "./protocol.js";
 import {
   DuckService,
   DuckTransport,
@@ -164,6 +164,23 @@ export class SimTransport implements DuckTransport {
   }
 
   call(_service: DuckService, method: string, params?: Record<string, unknown>): Promise<unknown> {
+    // The policy channel has no meaning here and saying so is the honest
+    // answer. The sidecar loads one fixed ONNX per role out of a vendored
+    // directory (`sim/duck_sim.py`); there is no robotd.toml to edit, no
+    // library to fetch into, and no origin to report. Answering with a
+    // plausible-looking slot table would be a lie about what is running, which
+    // is precisely the confusion `robot.policies` exists to end — so refuse.
+    if (method === M.robotPolicies || method === M.robotLoadPolicy) {
+      return Promise.reject(
+        new Error(
+          `${method} is not supported on the sim transport: the sidecar runs a ` +
+            `fixed set of vendored policies (${POLICY_SLOTS.length} roles, no config ` +
+            `file and no policy library), so it has no slots to report or override. ` +
+            `Use DUCK_TRANSPORT=mock to exercise the policy tools, or unix/ssh ` +
+            `against a real daemon.`,
+        ),
+      );
+    }
     return this.send(method, params, this.callTimeoutMs);
   }
 

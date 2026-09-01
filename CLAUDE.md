@@ -43,6 +43,19 @@ sessions on this repo.
    An agent auto-updating robot firmware is a footgun; revisit once the M8
    Hub policy channel ships, because that's when it becomes DuckHub's deploy
    backend (see sibling repo `duckhub`).
+5. **Policy channel: load + reset only** (`src/policy.ts`, upstream's
+   `policy-channel-design.md`). `duck_policy_list` / `duck_policy_load` /
+   `duck_policy_reset`. `policy update` and `policy check` are excluded by the
+   same rule as (4): nothing that fetches "the newest" and applies it. Load and
+   reset are the safe pair because reset is a one-word undo, and a load is a
+   config edit that survives a reboot (§3) so it needs one. Needs upstream
+   API_VERSION 17; a v16 daemon's METHOD_NOT_FOUND is translated into "your
+   daemon is too old". Origin (`pollen-robotics/*` official, any other HF repo
+   community, a path local) is a constant in `protocol.ts` and never a config
+   key. `walk = "none"` is refused: everything falls back to it. The HF
+   `manifest.json` pre-check can only REFUSE (wrong obs/action width, newer
+   `model_api`) — a missing or partial manifest still loads, because most of
+   the Hub publishes none and robotd's shape gate is the real check.
 
 ## Wire protocol: upstream's, verbatim (since 2026-08-29)
 
@@ -60,6 +73,9 @@ The shapes that needed adapting, and where the adapter is:
 | `duck_behavior quack`       | `robot.sound {tag:"chirp"}`                              | (what `robotctl quack` plays) |
 | battery floor               | `robot.health` → `battery:{volts,percent}`               | `preMotionCheck` reads `percent` |
 | `duck_monitor`              | `robot.subscribe {hz:50}` → first `robot.state` frame    | `DuckTransport.state()`: unix/ssh subscribe-and-take-one; sim/mock answer `robot.state` directly |
+| `duck_policy_list`          | `robot.policies`                                          | origin filled in from the source string when the daemon omits it |
+| `duck_policy_load`          | `robot.loadPolicy {slot, source}`                        | `policy.ts`: walk≠none, manifest pre-check, gated like motion (a load homes the robot and rebuilds all seven sessions) |
+| `duck_policy_reset`         | `robot.loadPolicy {slot, source: null}`                  | null = remove the config key (§3); no slot = all seven |
 | `duck_version`              | `system.info` (configd)                                  | |
 | `duck_updates`              | `update.listInstalled {component:"daemon"}`              | |
 

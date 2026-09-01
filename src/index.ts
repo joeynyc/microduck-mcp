@@ -13,7 +13,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { DuckTransport } from "./transport/types.js";
-import { DAEMON_COMPONENT, M } from "./transport/protocol.js";
+import { DAEMON_COMPONENT, M, OFFICIAL_HF_ORG, POLICY_SLOTS } from "./transport/protocol.js";
+import { listPolicies, loadPolicy, resetPolicy } from "./policy.js";
 import { MockTransport } from "./transport/mock.js";
 import { UnixTransport } from "./transport/unix.js";
 import { SshTransport } from "./transport/ssh.js";
@@ -169,6 +170,111 @@ server.registerTool(
           { type: "text" as const, text: JSON.stringify(meta) },
         ],
       };
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.registerTool(
+  "duck_policy_list",
+  {
+    title: "List policy slots",
+    description:
+      "What each of the seven policy slots (walk, stand, sitstand, " +
+      "ground_pick, kick_left, kick_right, roulade) is currently running, with " +
+      "its ORIGIN and version. Origin is decided by the Hugging Face org that " +
+      `published it: '${OFFICIAL_HF_ORG}/*' is official, any other HF repo is ` +
+      "community, a path on the board is local. Only official policies are what " +
+      "duck_policy_reset returns to. Read-only and always safe to call — call " +
+      "it before and after duck_policy_load so you can see what changed. " +
+      "Needs a daemon on API_VERSION 17 or newer.",
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      return json({ slots: await listPolicies(duck) });
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+// ---- Policy tools (guarded) ------------------------------------------------
+//
+// Deliberately NOT exposed: `policy update` and `policy check` from §7 of
+// upstream's policy-channel-design.md, and anything else that fetches "the
+// newest" and applies it. Same stance as `update.apply` (CLAUDE.md
+// "Deliberately excluded"): an agent that can auto-apply new code or new
+// weights onto hardware is a footgun, and which version to run is a decision a
+// human makes. load + reset is the safe pair precisely because reset is a
+// one-word undo — every load an agent makes is trivially reversible, which is
+// what makes trying a stranger's gait a reasonable thing to do at all.
+
+server.registerTool(
+  "duck_policy_load",
+  {
+    title: "Load a policy into a slot",
+    description:
+      "Put a different ONNX policy in one slot. source is a Hugging Face repo " +
+      "('org/name', optionally 'org/name@revision'), a name already in the " +
+      "robot's policy library, or an absolute path to a .onnx on the board. " +
+      `ORIGIN follows the HF org: '${OFFICIAL_HF_ORG}/*' is official, any other ` +
+      "repo is community (unsigned, never auto-updated, never a reset target), " +
+      "and a path is local. Before an HF repo is fetched its manifest.json is " +
+      "read and the load is refused early if it declares a different " +
+      "observation/action width or needs a newer daemon — but a repo with no " +
+      "manifest is still accepted, because most of the Hub publishes none; " +
+      "robotd's own shape gate is the real check. source='none' switches a slot " +
+      "off — allowed for every slot EXCEPT walk, which the others fall back to. " +
+      "The change is written to the robot's config, so it SURVIVES A REBOOT: " +
+      "duck_policy_reset is the undo. A load that fails to build keeps the " +
+      "policy that was already running. Battery- and health-gated like motion.",
+    inputSchema: {
+      slot: z.enum(POLICY_SLOTS).describe("Which of the seven slots to fill."),
+      source: z
+        .string()
+        .min(1)
+        .describe("HF repo 'org/name[@rev]', a library name, a path on the board, or 'none'."),
+    },
+  },
+  async ({ slot, source }) => {
+    try {
+      // A load homes the robot and rebuilds every ONNX session under the
+      // running 50 Hz loop (§4), so it is motion in every sense that matters
+      // to this server's safety layer, and it is gated like motion.
+      await preMotionCheck(duck);
+      return json(await loadPolicy(duck, slot, source));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.registerTool(
+  "duck_policy_reset",
+  {
+    title: "Reset policy slots to official",
+    description:
+      "Undo a duck_policy_load: remove the override on one slot, or on all " +
+      "seven when no slot is given ('put it back the way it came'). The slot " +
+      "goes back to the official policy for that role — official is the only " +
+      "origin reset returns to, and a community or local policy is never a " +
+      "reset target. Resetting a slot nobody overrode is a no-op that queues no " +
+      "work. This is the one-word undo for anything duck_policy_load did, " +
+      "including a load that survived a reboot; reach for it whenever a gait " +
+      "misbehaves and you are not sure why. Battery- and health-gated like motion.",
+    inputSchema: {
+      slot: z
+        .enum(POLICY_SLOTS)
+        .optional()
+        .describe("Which slot to reset. Omit to reset all seven."),
+    },
+  },
+  async ({ slot }) => {
+    try {
+      await preMotionCheck(duck);
+      return json(await resetPolicy(duck, slot));
     } catch (e) {
       return fail(e);
     }
