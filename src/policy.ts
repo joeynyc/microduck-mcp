@@ -235,7 +235,7 @@ async function callPolicyMethod(
   params?: Record<string, unknown>,
 ): Promise<unknown> {
   try {
-    return await t.call("robotd", method, params);
+    return await t.call(method, params);
   } catch (e) {
     throw daemonTooOld(method, e);
   }

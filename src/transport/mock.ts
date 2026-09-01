@@ -1,5 +1,6 @@
 import { DAEMON_COMPONENT, M, POLICY_SLOTS, PolicyEntry, PolicySlot, RobotState } from "./protocol.js";
-import { DuckService, DuckTransport, Snapshot, SnapshotRequest } from "./types.js";
+import { DuckTransport, Snapshot, SnapshotRequest } from "./types.js";
+import { parseSource } from "../policy.js";
 
 /** 8×6 duck-yellow PNG, so duck_camera returns a valid image on mock. */
 const MOCK_PNG =
@@ -50,7 +51,7 @@ export class MockTransport implements DuckTransport {
    */
   private overrides = new Map<PolicySlot, string>();
 
-  async call(_service: DuckService, method: string, params?: Record<string, unknown>): Promise<unknown> {
+  async call(method: string, params?: Record<string, unknown>): Promise<unknown> {
     this.volts = Math.max(6.7, this.volts - 0.001);
 
     switch (method) {
@@ -131,10 +132,11 @@ export class MockTransport implements DuckTransport {
   }
 
   /**
-   * One row per slot. Origin is read off the source string by §2's rule (the
-   * org in the path is what makes it honest without a lookup, §9.2), and the
-   * version is rendered by what the publisher offers (§6): official policies
-   * get the set's semver, community ones their revision, local ones `local`.
+   * One row per slot. Origin is read off the source string by §2's rule — the
+   * same `parseSource` the real tools use, so the mock cannot disagree with
+   * them — and the version is rendered by what the publisher offers (§6):
+   * official policies get the set's semver, HF ones their revision, local
+   * ones `local`.
    */
   private policyRows(): PolicyEntry[] {
     return POLICY_SLOTS.map((slot) => {
@@ -148,18 +150,16 @@ export class MockTransport implements DuckTransport {
           version: OFFICIAL_SET_VERSION,
         };
       }
-      if (override === "none") {
+      const parsed = parseSource(override);
+      if (parsed.kind === "none") {
         return { slot, policy: null, source: "none", origin: "local" as const, version: null };
       }
-      const isPath = override.startsWith("/") || override.startsWith("~") || override.endsWith(".onnx");
-      const [repo, rev] = override.split("@");
-      const org = repo.includes("/") ? repo.split("/")[0] : undefined;
       return {
         slot,
-        policy: isPath ? override : `${repo}:policy.onnx`,
+        policy: parsed.kind === "hf" ? `${parsed.repo}:policy.onnx` : override,
         source: override,
-        origin: isPath ? ("local" as const) : org === "pollen-robotics" ? ("official" as const) : org ? ("community" as const) : ("unknown" as const),
-        version: isPath ? "local" : (rev ?? "main"),
+        origin: parsed.origin,
+        version: parsed.kind === "hf" ? parsed.rev : parsed.kind === "path" ? "local" : null,
       };
     });
   }

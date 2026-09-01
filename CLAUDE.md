@@ -66,7 +66,7 @@ The shapes that needed adapting, and where the adapter is:
 
 | agent-facing                | on the wire                                              | adapter |
 |-----------------------------|----------------------------------------------------------|---------|
-| `duck_walk {vx,vy,wz}`      | `robot.move {vx,vy,vyaw}` re-sent every 250 ms, then `robot.stop` | `walk()` in safety.ts (intents are deadman-stamped; a walk is a stream) |
+| `duck_walk {vx,vy,wz}`      | `robot.move {vx,vy,vyaw}` re-sent every 200 ms on a fixed grid (deadman is 500 ms), then `robot.stop` | `walk()` in safety.ts (intents are deadman-stamped; a walk is a stream) |
 | `duck_behavior sit/stand`   | `robot.do {skill:"sit_toggle"}`                          | tool checks `state().policy === "sit"` first, so sit-while-seated is a no-op |
 | `duck_behavior getup`       | `robot.init` (power joints, ramp to home)                | gate "recovery"; on hardware a human rights the duck first |
 | `duck_behavior pickup/kick/roulade` | `robot.do {skill: ground_pick / kick_right / roulade}` | `BEHAVIORS` table in safety.ts |
@@ -127,7 +127,7 @@ yet: `robot.head`, `robot.look`, `robot.pose`, `robot.mouth`, `robot.enable`,
 - [x] `duck_camera` tool — sim renders; hardware path via mediad WebRTC still TODO
 - [ ] `duck_head` tool (`robot.head`) — sim already handles it
 - [ ] `duck_depth` tool — tofd's 8×8 matrix via `tof.stream` subscription
-- [x] `duck_monitor` — one-shot state sample (joints, gravity, odometry) — mock `robot.state`; method name provisional like the rest
+- [x] `duck_monitor` — one-shot state sample (joints, gravity, odometry)
 - [x] Tests: safety layer unit tests (`npm test`, node:test on dist)
 - [x] Tests: sim transport contract tests (fake stdio sidecar, no MuJoCo)
 - [x] Tests: unix contract tests against a fake robotd socket (incl.
@@ -155,10 +155,18 @@ yet: `robot.head`, `robot.look`, `robot.pose`, `robot.mouth`, `robot.enable`,
   (quack: none; getup: recovery = allowUnhealthy, battery + rate limit still
   apply); the tool enum derives from that table — add behaviors there.
 - `duck_walk` is transport-independent: `walk()` in `safety.ts` re-sends
-  `robot.move` every 250 ms for `duration_s` then sends `robot.stop`, because
+  `robot.move` every 200 ms (on a fixed grid, under the 500 ms deadman) for `duration_s` then sends `robot.stop`, because
   upstream's intents are deadman-stamped. `duck_stop` interrupts it via
   `stopWalk()`.
 - Never spell a wire method inline — import `M` from `transport/protocol.ts`.
+  `DuckTransport.call(method, params)` routes to the daemon by the method's
+  namespace (`serviceFor` in `types.ts`); there is no service argument.
+- Every tool is registered through `tool()` in `index.ts`, which turns a
+  thrown error into an `isError` result. Don't call `server.registerTool`
+  directly. The server closes its transport on SIGINT/SIGTERM/SIGHUP and when
+  the client disconnects (kills the ssh tunnel / sim sidecar, removes temp
+  dirs); `SshTransport` forgets a failed or dead tunnel so the next call
+  reconnects.
 - Camera is a transport *capability* (`DuckTransport.snapshot?`), not an RPC
   name: sim renders, mock returns a placeholder, unix/ssh have none until
   mediad is wired.

@@ -12,7 +12,7 @@ import {
 import { POLICY_SLOTS } from "../transport/protocol.js";
 import { MockTransport } from "../transport/mock.js";
 import { SimTransport } from "../transport/sim.js";
-import { DuckService, DuckTransport } from "../transport/types.js";
+import { DuckTransport } from "../transport/types.js";
 
 /** Transport stub: records every policy call, answers whatever it is given. */
 function stub(answers: Record<string, unknown> = {}): DuckTransport & {
@@ -23,7 +23,7 @@ function stub(answers: Record<string, unknown> = {}): DuckTransport & {
     async state() {
       return { policy: "stand" } as any;
     },
-    async call(_s: DuckService, method: string, params?: Record<string, unknown>) {
+    async call(method: string, params?: Record<string, unknown>) {
       this.calls.push({ method, params });
       if (method in answers) {
         const a = answers[method];
@@ -287,15 +287,15 @@ describe("MockTransport policy channel", () => {
   });
 
   test("a request already satisfied queues no work (§4)", async () => {
-    const untouched = (await m.call("robotd", "robot.loadPolicy", { slot: "roulade", source: null })) as any;
+    const untouched = (await m.call("robot.loadPolicy", { slot: "roulade", source: null })) as any;
     assert.equal(untouched.queued, false);
     await loadPolicy(m, "roulade", "someone/roulade", manifests());
-    const again = (await m.call("robotd", "robot.loadPolicy", { slot: "roulade", source: "someone/roulade" })) as any;
+    const again = (await m.call("robot.loadPolicy", { slot: "roulade", source: "someone/roulade" })) as any;
     assert.equal(again.queued, false);
   });
 
   test("an unknown slot is refused", async () => {
-    await assert.rejects(() => m.call("robotd", "robot.loadPolicy", { slot: "backflip", source: "x" }), /no such policy slot/);
+    await assert.rejects(() => m.call("robot.loadPolicy", { slot: "backflip", source: "x" }), /no such policy slot/);
   });
 });
 
@@ -303,7 +303,7 @@ describe("SimTransport policy channel", () => {
   test("says it is unsupported rather than inventing slots", async () => {
     const t = new SimTransport({ python: process.execPath, script: "/nonexistent" });
     for (const method of ["robot.policies", "robot.loadPolicy"]) {
-      await assert.rejects(() => t.call("robotd", method), /not supported on the sim transport/);
+      await assert.rejects(() => t.call(method), /not supported on the sim transport/);
     }
     await t.close();
   });

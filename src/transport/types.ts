@@ -51,12 +51,11 @@ export interface Snapshot {
 }
 
 export interface DuckTransport {
-  /** Send one JSON-RPC request to the daemon that owns the method's namespace. */
-  call(
-    service: DuckService,
-    method: string,
-    params?: Record<string, unknown>,
-  ): Promise<unknown>;
+  /**
+   * Send one JSON-RPC request. The daemon is implied by the method's
+   * namespace (`serviceFor`), so a caller cannot misroute a method.
+   */
+  call(method: string, params?: Record<string, unknown>): Promise<unknown>;
   /**
    * One robot.state frame. Upstream publishes state only as a subscription
    * stream, so "one sample" is a transport concern: the socket transports
@@ -86,7 +85,7 @@ export function serviceFor(method: string): DuckService {
 /** The health probe every transport uses for `ping()`. */
 export async function pingViaHealth(t: Pick<DuckTransport, "call">): Promise<boolean> {
   try {
-    await t.call("robotd", M.robotHealth);
+    await t.call(M.robotHealth);
     return true;
   } catch {
     return false;

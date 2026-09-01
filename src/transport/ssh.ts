@@ -14,6 +14,11 @@ import { SOCKETS, UnixTransport } from "./unix.js";
  * through UnixTransport. Same protocol, same code path as on the robot; the
  * only ssh-specific part is the tunnel. (The v0 design shelled out to
  * `robotctl`, which has no motion subcommands — a dead end for walking.)
+ *
+ * The tunnel is started lazily on the first call and re-established on the
+ * next call after it fails or dies: a robot on wifi drops out, and a transport
+ * that remembered the first failure forever would need a server restart to
+ * recover.
  */
 export class SshTransport implements DuckTransport {
   private proc?: ChildProcess;
@@ -24,6 +29,7 @@ export class SshTransport implements DuckTransport {
     private host: string, // e.g. "duck@microduck.local"
     private sshArgs: string[] = ["-o", "ConnectTimeout=5", "-o", "ExitOnForwardFailure=yes"],
     private readyTimeoutMs = 15_000,
+    private sshBin = "ssh",
   ) {}
 
   /** Local socket paths for a forwarding directory. */
@@ -42,12 +48,17 @@ export class SshTransport implements DuckTransport {
     return ["-N", ...sshArgs, ...forwards, host];
   }
 
+  /** True while a tunnel is up (or being brought up). Tests read this. */
+  get connected(): boolean {
+    return this.inner !== undefined;
+  }
+
   private start(): Promise<UnixTransport> {
     if (this.inner) return this.inner;
     this.inner = new Promise<UnixTransport>((resolve, reject) => {
       const dir = (this.dir = mkdtempSync(join(tmpdir(), "duck-ssh-")));
       const local = SshTransport.localPaths(dir);
-      const proc = (this.proc = spawn("ssh", SshTransport.forwardArgs(this.host, this.sshArgs, dir), {
+      const proc = (this.proc = spawn(this.sshBin, SshTransport.forwardArgs(this.host, this.sshArgs, dir), {
         stdio: ["ignore", "ignore", "pipe"],
       }));
       let stderr = "";
@@ -55,10 +66,12 @@ export class SshTransport implements DuckTransport {
       const deadline = Date.now() + this.readyTimeoutMs;
       const fail = (why: string) => {
         clearInterval(poll);
+        // Forget this tunnel so the next call tries again from scratch.
+        this.teardown(proc);
         reject(new Error(`ssh to ${this.host}: ${why}${stderr ? `\n${stderr.trim()}` : ""}`));
       };
       proc.on("error", (e) => fail(e.message));
-      proc.on("exit", (code) => fail(`exited with code ${code} before the sockets came up`));
+      proc.on("exit", (code) => fail(`exited with code ${code}`));
       const poll = setInterval(() => {
         if (Object.values(local).every(existsSync)) {
           clearInterval(poll);
@@ -72,8 +85,17 @@ export class SshTransport implements DuckTransport {
     return this.inner;
   }
 
-  async call(service: DuckService, method: string, params?: Record<string, unknown>): Promise<unknown> {
-    return (await this.start()).call(service, method, params);
+  /** Drop the state for `proc`'s tunnel, if it is still the current one. */
+  private teardown(proc: ChildProcess | undefined): void {
+    if (proc && this.proc !== proc) return; // a newer tunnel already replaced it
+    this.proc = undefined;
+    this.inner = undefined;
+    if (this.dir) rmSync(this.dir, { recursive: true, force: true });
+    this.dir = undefined;
+  }
+
+  async call(method: string, params?: Record<string, unknown>): Promise<unknown> {
+    return (await this.start()).call(method, params);
   }
 
   async state(): Promise<RobotState> {
@@ -89,9 +111,6 @@ export class SshTransport implements DuckTransport {
 
   async close(): Promise<void> {
     this.proc?.kill();
-    this.proc = undefined;
-    this.inner = undefined;
-    if (this.dir) rmSync(this.dir, { recursive: true, force: true });
-    this.dir = undefined;
+    this.teardown(undefined);
   }
 }

@@ -9,6 +9,7 @@ import {
   JsonRpcResponse,
   pingViaHealth,
   rpcErrorMessage,
+  serviceFor,
 } from "./types.js";
 
 export const SOCKETS: Record<DuckService, string> = {
@@ -32,9 +33,9 @@ export class UnixTransport implements DuckTransport {
     private timeoutMs = 5000,
   ) {}
 
-  call(service: DuckService, method: string, params?: Record<string, unknown>): Promise<unknown> {
+  call(method: string, params?: Record<string, unknown>): Promise<unknown> {
     const id = this.nextId++;
-    return this.exchange(service, { jsonrpc: "2.0", id, method, params }, (msg) => {
+    return this.exchange(serviceFor(method), { jsonrpc: "2.0", id, method, params }, (msg) => {
       if (!("id" in msg) || msg.id !== id) return undefined;
       if (msg.error) throw new Error(`${method}: ${rpcErrorMessage(msg.error)}`);
       return { value: msg.result };

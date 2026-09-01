@@ -11,7 +11,7 @@ import {
   stopWalk,
   walk,
 } from "../safety.js";
-import { DuckService, DuckTransport } from "../transport/types.js";
+import { DuckTransport } from "../transport/types.js";
 
 /** Transport stub: returns a fixed health payload, records every call. */
 function stub(health: unknown): DuckTransport & { calls: string[] } {
@@ -20,7 +20,7 @@ function stub(health: unknown): DuckTransport & { calls: string[] } {
     async state() {
       return { policy: "stand" } as any;
     },
-    async call(_s: DuckService, method: string) {
+    async call(method: string) {
       this.calls.push(method);
       if (method === "robot.health") return health;
       if (method === "robot.state") return { policy: "stand" };
@@ -180,6 +180,24 @@ describe("walk", () => {
     assert.equal(r.interrupted, true);
     assert.ok(!t.calls.includes("robot.stop"), "duck_stop sends robot.stop itself");
     assert.ok(t.calls.length < 10, "did not keep walking after stopWalk");
+  });
+
+  test("re-sends on a fixed grid, so a slow round trip does not stretch the period", async () => {
+    // Each intent takes 40 ms to answer; with a 50 ms grid over 300 ms we
+    // still expect ~6 sends. An additive loop (sleep, then await) would
+    // manage ~3 and hand the deadman a 90 ms period.
+    const t = stub(OK);
+    const slow: DuckTransport = {
+      ...t,
+      async call(method: string) {
+        await new Promise((r) => setTimeout(r, 40));
+        return t.call(method);
+      },
+    };
+    const r = await walk(slow, { vx: 0.1, vy: 0, vyaw: 0 }, 0.3, 50);
+    const intents = t.calls.filter((c) => c === "robot.move").length;
+    assert.ok(intents >= 5, `expected ~6 intents on the grid, got ${intents}`);
+    assert.equal(r.interrupted, false);
   });
 
   test("a refused intent aborts the walk", async () => {

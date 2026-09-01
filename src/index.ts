@@ -11,7 +11,8 @@
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
+import { createRequire } from "node:module";
+import { z, ZodRawShape } from "zod";
 import { DuckTransport } from "./transport/types.js";
 import { DAEMON_COMPONENT, M, OFFICIAL_HF_ORG, POLICY_SLOTS } from "./transport/protocol.js";
 import { listPolicies, loadPolicy, resetPolicy } from "./policy.js";
@@ -30,8 +31,11 @@ import {
   walk,
 } from "./safety.js";
 
+const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
+const transportName = process.env.DUCK_TRANSPORT ?? "mock";
+
 function pickTransport(): DuckTransport {
-  switch (process.env.DUCK_TRANSPORT) {
+  switch (transportName) {
     case "unix":
       return new UnixTransport();
     case "sim":
@@ -47,19 +51,38 @@ function pickTransport(): DuckTransport {
 }
 
 const duck = pickTransport();
-const server = new McpServer({ name: "microduck-mcp", version: "0.1.0" });
+const server = new McpServer({ name: "microduck-mcp", version });
 
-const json = (v: unknown) => ({
-  content: [{ type: "text" as const, text: JSON.stringify(v, null, 2) }],
-});
-const fail = (e: unknown) => ({
-  content: [{ type: "text" as const, text: `Error: ${(e as Error).message}` }],
-  isError: true,
-});
+type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
+type ToolResult = { content: Content[]; isError?: boolean };
+
+const json = (v: unknown): ToolResult => ({ content: [{ type: "text", text: JSON.stringify(v, null, 2) }] });
+
+/**
+ * Register a tool whose handler may throw: the error becomes an `isError`
+ * result with an agent-readable message instead of a protocol failure. Every
+ * tool goes through here, so none can forget its error handling.
+ */
+function tool<S extends ZodRawShape>(
+  name: string,
+  meta: { title: string; description: string; inputSchema: S },
+  handler: (args: z.infer<z.ZodObject<S>>) => Promise<ToolResult>,
+): void {
+  // The SDK's callback generic does not unify with a caller-supplied shape;
+  // the cast is on the callback only, so `meta` is still checked.
+  const cb = async (args: z.infer<z.ZodObject<S>>): Promise<ToolResult> => {
+    try {
+      return await handler(args);
+    } catch (e) {
+      return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true };
+    }
+  };
+  server.registerTool(name, meta, cb as Parameters<typeof server.registerTool>[2]);
+}
 
 // ---- Read-only tools -------------------------------------------------------
 
-server.registerTool(
+tool(
   "duck_health",
   {
     title: "Duck health",
@@ -71,32 +94,20 @@ server.registerTool(
       "sequence of motion commands.",
     inputSchema: {},
   },
-  async () => {
-    try {
-      return json(await duck.call("robotd", M.robotHealth));
-    } catch (e) {
-      return fail(e);
-    }
-  },
+  async () => json(await duck.call(M.robotHealth)),
 );
 
-server.registerTool(
+tool(
   "duck_version",
   {
     title: "Duck identity and uptime",
     description: "The robot's name, serial and uptime (configd system.info). Read-only.",
     inputSchema: {},
   },
-  async () => {
-    try {
-      return json(await duck.call("configd", M.systemInfo));
-    } catch (e) {
-      return fail(e);
-    }
-  },
+  async () => json(await duck.call(M.systemInfo)),
 );
 
-server.registerTool(
+tool(
   "duck_updates",
   {
     title: "List installed releases",
@@ -106,16 +117,10 @@ server.registerTool(
       "see CLAUDE.md 'Deliberately excluded'.)",
     inputSchema: {},
   },
-  async () => {
-    try {
-      return json(await duck.call("updaterd", M.updateListInstalled, { component: DAEMON_COMPONENT }));
-    } catch (e) {
-      return fail(e);
-    }
-  },
+  async () => json(await duck.call(M.updateListInstalled, { component: DAEMON_COMPONENT })),
 );
 
-server.registerTool(
+tool(
   "duck_monitor",
   {
     title: "Duck state sample",
@@ -129,16 +134,10 @@ server.registerTool(
       "temps use duck_health.",
     inputSchema: {},
   },
-  async () => {
-    try {
-      return json(await duck.state());
-    } catch (e) {
-      return fail(e);
-    }
-  },
+  async () => json(await duck.state()),
 );
 
-server.registerTool(
+tool(
   "duck_camera",
   {
     title: "Duck camera",
@@ -159,24 +158,18 @@ server.registerTool(
     },
   },
   async (req) => {
-    try {
-      if (!duck.snapshot) {
-        return fail(new Error(`no camera on the ${process.env.DUCK_TRANSPORT ?? "mock"} transport`));
-      }
-      const { png_base64, ...meta } = await duck.snapshot(req);
-      return {
-        content: [
-          { type: "image" as const, data: png_base64, mimeType: "image/png" },
-          { type: "text" as const, text: JSON.stringify(meta) },
-        ],
-      };
-    } catch (e) {
-      return fail(e);
-    }
+    if (!duck.snapshot) throw new Error(`no camera on the ${transportName} transport`);
+    const { png_base64, ...meta } = await duck.snapshot(req);
+    return {
+      content: [
+        { type: "image", data: png_base64, mimeType: "image/png" },
+        { type: "text", text: JSON.stringify(meta) },
+      ],
+    };
   },
 );
 
-server.registerTool(
+tool(
   "duck_policy_list",
   {
     title: "List policy slots",
@@ -191,13 +184,7 @@ server.registerTool(
       "Needs a daemon on API_VERSION 17 or newer.",
     inputSchema: {},
   },
-  async () => {
-    try {
-      return json({ slots: await listPolicies(duck) });
-    } catch (e) {
-      return fail(e);
-    }
-  },
+  async () => json({ slots: await listPolicies(duck) }),
 );
 
 // ---- Policy tools (guarded) ------------------------------------------------
@@ -211,7 +198,7 @@ server.registerTool(
 // one-word undo — every load an agent makes is trivially reversible, which is
 // what makes trying a stranger's gait a reasonable thing to do at all.
 
-server.registerTool(
+tool(
   "duck_policy_load",
   {
     title: "Load a policy into a slot",
@@ -239,19 +226,15 @@ server.registerTool(
     },
   },
   async ({ slot, source }) => {
-    try {
-      // A load homes the robot and rebuilds every ONNX session under the
-      // running 50 Hz loop (§4), so it is motion in every sense that matters
-      // to this server's safety layer, and it is gated like motion.
-      await preMotionCheck(duck);
-      return json(await loadPolicy(duck, slot, source));
-    } catch (e) {
-      return fail(e);
-    }
+    // A load homes the robot and rebuilds every ONNX session under the
+    // running 50 Hz loop (§4), so it is motion in every sense that matters
+    // to this server's safety layer, and it is gated like motion.
+    await preMotionCheck(duck);
+    return json(await loadPolicy(duck, slot, source));
   },
 );
 
-server.registerTool(
+tool(
   "duck_policy_reset",
   {
     title: "Reset policy slots to official",
@@ -272,18 +255,14 @@ server.registerTool(
     },
   },
   async ({ slot }) => {
-    try {
-      await preMotionCheck(duck);
-      return json(await resetPolicy(duck, slot));
-    } catch (e) {
-      return fail(e);
-    }
+    await preMotionCheck(duck);
+    return json(await resetPolicy(duck, slot));
   },
 );
 
 // ---- Motion tools (guarded) ------------------------------------------------
 
-server.registerTool(
+tool(
   "duck_walk",
   {
     title: "Walk the duck",
@@ -309,16 +288,12 @@ server.registerTool(
     },
   },
   async ({ vx, vy, wz, duration_s }) => {
-    try {
-      await preMotionCheck(duck);
-      return json(await walk(duck, clampVelocity(vx, vy, wz), duration_s));
-    } catch (e) {
-      return fail(e);
-    }
+    await preMotionCheck(duck);
+    return json(await walk(duck, clampVelocity(vx, vy, wz), duration_s));
   },
 );
 
-server.registerTool(
+tool(
   "duck_behavior",
   {
     title: "Run a behavior",
@@ -335,26 +310,24 @@ server.registerTool(
     },
   },
   async ({ name }) => {
-    try {
-      await preBehaviorCheck(duck, name);
-      // Upstream's sit↔stand is one toggle; the daemon knows which way. We
-      // check the frame so "sit" while seated doesn't stand the duck up.
-      if (name === "sit" || name === "stand") {
-        const seated = (await duck.state()).policy === "sit";
-        if (seated === (name === "sit")) {
-          return json({ behavior: name, started: false, note: `already ${name === "sit" ? "sitting" : "standing"}` });
-        }
+    // Upstream's sit↔stand is one toggle; the daemon knows which way. We
+    // check the frame so "sit" while seated doesn't stand the duck up — and
+    // we check before the gate, so a no-op costs neither a health round trip
+    // nor a rate-limit slot.
+    if (name === "sit" || name === "stand") {
+      const seated = (await duck.state()).policy === "sit";
+      if (seated === (name === "sit")) {
+        return json({ behavior: name, started: false, note: `already ${name === "sit" ? "sitting" : "standing"}` });
       }
-      const { method, params } = BEHAVIORS[name];
-      const result = await duck.call("robotd", method, { ...params });
-      return json({ behavior: name, started: true, wire: { method, params }, result });
-    } catch (e) {
-      return fail(e);
     }
+    await preBehaviorCheck(duck, name);
+    const { method, params } = BEHAVIORS[name];
+    const result = await duck.call(method, { ...params });
+    return json({ behavior: name, started: true, wire: { method, params }, result });
   },
 );
 
-server.registerTool(
+tool(
   "duck_stop",
   {
     title: "STOP the duck",
@@ -365,23 +338,41 @@ server.registerTool(
     inputSchema: {},
   },
   async () => {
-    try {
-      stopWalk();
-      return json(await duck.call("robotd", M.robotStop));
-    } catch (e) {
-      return fail(e);
-    }
+    stopWalk();
+    return json(await duck.call(M.robotStop));
   },
 );
 
 // ---------------------------------------------------------------------------
 
+let shuttingDown = false;
+/**
+ * End any walk, release the transport (kills the ssh tunnel / sim sidecar and
+ * removes their temp dirs), exit. Idempotent: the client hanging up and a
+ * signal can both arrive.
+ */
+async function shutdown(why: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.error(`microduck-mcp shutting down (${why})`);
+  stopWalk();
+  try {
+    await duck.close();
+  } finally {
+    process.exit(0);
+  }
+}
+
 async function main() {
   const transport = new StdioServerTransport();
+  transport.onclose = () => void shutdown("client disconnected");
+  // The SDK's stdio transport only closes on a read error, not on EOF, and a
+  // live ssh/sim child would otherwise keep this process alive after the
+  // client has gone.
+  process.stdin.once("end", () => void shutdown("client closed stdin"));
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(sig, () => void shutdown(sig));
   await server.connect(transport);
-  console.error(
-    `microduck-mcp up (transport: ${process.env.DUCK_TRANSPORT ?? "mock"})`,
-  );
+  console.error(`microduck-mcp ${version} up (transport: ${transportName})`);
 }
 
 main().catch((e) => {

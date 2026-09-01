@@ -67,6 +67,15 @@ export function clampVelocity(vx: number, vy: number, vyaw: number): Twist {
 }
 
 /**
+ * robotd zeroes the velocity when the newest intent is older than its
+ * `safety.deadman_ms`, 500 by default (upstream robotd-params). Re-sends are
+ * scheduled on a fixed grid from the first send, so a slow round trip (a fresh
+ * connection over ssh on wifi) eats into the margin instead of adding to the
+ * period — at 200 ms one whole intent can be lost before the duck stalls.
+ */
+export const WALK_RESEND_MS = 200;
+
+/**
  * Drive a velocity intent for `durationS`, transport-independently: robotd's
  * `robot.move` is a deadman-stamped intent, so a walk of any length is a
  * stream of intents followed by a stop. Re-sends every `intervalMs`, then
@@ -77,21 +86,28 @@ export async function walk(
   t: DuckTransport,
   v: Twist,
   durationS: number,
-  intervalMs = 250,
+  intervalMs = WALK_RESEND_MS,
 ): Promise<{ applied: Twist; result: unknown; duration_s: number; interrupted: boolean }> {
   const epoch = ++walkEpoch;
-  const result = await t.call("robotd", M.robotMove, v);
-  const until = Date.now() + durationS * 1000;
+  const started = Date.now();
+  const result = await t.call(M.robotMove, v);
+  const until = started + durationS * 1000;
   let interrupted = false;
-  while (Date.now() < until) {
-    await new Promise((r) => setTimeout(r, Math.min(intervalMs, until - Date.now())));
+  for (let next = started + intervalMs; next < until; next += intervalMs) {
+    const wait = next - Date.now();
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
     if (walkEpoch !== epoch) {
       interrupted = true;
       break;
     }
-    if (Date.now() < until) await t.call("robotd", M.robotMove, v);
+    await t.call(M.robotMove, v);
   }
-  if (!interrupted) await t.call("robotd", M.robotStop);
+  if (!interrupted) {
+    const wait = until - Date.now();
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    if (walkEpoch !== epoch) interrupted = true;
+  }
+  if (!interrupted) await t.call(M.robotStop);
   return { applied: v, result, duration_s: durationS, interrupted };
 }
 
@@ -116,7 +132,7 @@ export async function preMotionCheck(
       `Rate limited: wait ${LIMITS.motionCooldownMs}ms between motion commands.`,
     );
   }
-  const health = (await t.call("robotd", M.robotHealth)) as HealthResult;
+  const health = (await t.call(M.robotHealth)) as HealthResult;
   const pct = health?.battery?.percent;
   if (typeof pct === "number" && pct / 100 < LIMITS.minBatteryForMotion) {
     throw new Error(

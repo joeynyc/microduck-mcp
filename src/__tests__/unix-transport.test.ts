@@ -57,9 +57,9 @@ const paths = { robotd: sock, configd: sock, updaterd: sock };
 describe("UnixTransport", () => {
   test("round-trips a request by id", async () => {
     const t = new UnixTransport(paths, 500);
-    const h = (await t.call("robotd", "robot.health")) as { healthy: boolean };
+    const h = (await t.call("robot.health")) as { healthy: boolean };
     assert.equal(h.healthy, true);
-    const m = (await t.call("robotd", "robot.move", { vx: 0.1, vy: 0, vyaw: 0 })) as { echo: unknown };
+    const m = (await t.call("robot.move", { vx: 0.1, vy: 0, vyaw: 0 })) as { echo: unknown };
     assert.deepEqual(m.echo, { vx: 0.1, vy: 0, vyaw: 0 });
     assert.equal(await t.ping(), true);
   });
@@ -74,27 +74,36 @@ describe("UnixTransport", () => {
 
   test("maps a JSON-RPC error to a rejection naming the method", async () => {
     const t = new UnixTransport(paths, 500);
-    await assert.rejects(() => t.call("robotd", "robot.nope"), /robot\.nope: method not found/);
+    await assert.rejects(() => t.call("robot.nope"), /robot\.nope: method not found/);
   });
 
   test("times out when the daemon never answers", async () => {
     const t = new UnixTransport(paths, 200);
-    await assert.rejects(() => t.call("robotd", "hang"), /timed out after 200ms/);
+    await assert.rejects(() => t.call("hang"), /timed out after 200ms/);
   });
 
   test("rejects when the daemon hangs up without answering", async () => {
     const t = new UnixTransport(paths, 500);
-    await assert.rejects(() => t.call("robotd", "hangup"), /closed without an answer/);
+    await assert.rejects(() => t.call("hangup"), /closed without an answer/);
   });
 
   test("rejects when the socket does not exist", async () => {
     const t = new UnixTransport({ ...paths, robotd: join(dir, "missing.sock") }, 500);
-    await assert.rejects(() => t.call("robotd", "robot.health"), /ENOENT|ECONNREFUSED/);
+    await assert.rejects(() => t.call("robot.health"), /ENOENT|ECONNREFUSED/);
     assert.equal(await t.ping(), false);
   });
 });
 
 describe("SshTransport", () => {
+  test("a failed tunnel is forgotten, so the next call tries again", async () => {
+    const t = new SshTransport("duck@nowhere", [], 2000, join(dir, "no-such-ssh"));
+    await assert.rejects(() => t.call("robot.health"), /ssh to duck@nowhere: .*ENOENT/);
+    assert.equal(t.connected, false, "the rejected start must not be cached");
+    await assert.rejects(() => t.call("robot.health"), /ENOENT/);
+    assert.equal(await t.ping(), false);
+    await t.close();
+  });
+
   test("forwards all three daemon sockets into the local dir", () => {
     const args = SshTransport.forwardArgs("duck@host", ["-o", "X=y"], "/tmp/d");
     assert.deepEqual(args, [

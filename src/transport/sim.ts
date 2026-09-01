@@ -5,7 +5,6 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { M, POLICY_SLOTS, RobotState } from "./protocol.js";
 import {
-  DuckService,
   DuckTransport,
   JsonRpcRequest,
   JsonRpcResponse,
@@ -163,7 +162,7 @@ export class SimTransport implements DuckTransport {
     });
   }
 
-  call(_service: DuckService, method: string, params?: Record<string, unknown>): Promise<unknown> {
+  call(method: string, params?: Record<string, unknown>): Promise<unknown> {
     // The policy channel has no meaning here and saying so is the honest
     // answer. The sidecar loads one fixed ONNX per role out of a vendored
     // directory (`sim/duck_sim.py`); there is no robotd.toml to edit, no
