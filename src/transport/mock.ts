@@ -1,6 +1,15 @@
-import { DAEMON_COMPONENT, M, POLICY_SLOTS, PolicyEntry, PolicySlot, RobotState } from "./protocol.js";
+import {
+  DAEMON_COMPONENT,
+  M,
+  OFFICIAL_HF_ORG,
+  POLICY_NONE,
+  POLICY_SLOTS,
+  PoliciesResult,
+  PolicySlot,
+  PolicySlotRow,
+  RobotState,
+} from "./protocol.js";
 import { DuckTransport, Snapshot, SnapshotRequest } from "./types.js";
-import { parseSource } from "../policy.js";
 
 /** 8×6 duck-yellow PNG, so duck_camera returns a valid image on mock. */
 const MOCK_PNG =
@@ -14,20 +23,26 @@ const j = (pos_rad: number, vel_rad_s: number, temp_c: number) => ({
 
 /**
  * What each slot runs when nothing overrides it — the official set, copied
- * from policy-channel-design.md §10 (the mapping is not recoverable from the
- * names on the Hub, which is why upstream records it). Version is the
- * `policies` component's semver, as §6 renders an official policy.
+ * from policy-channel-design.md §11, at the paths the library gives an
+ * official fetch (`/var/lib/robot/policies/<org>/<name>/<rev>/<file>`).
  */
+const LIBRARY = "/var/lib/robot/policies";
+const OFFICIAL_SET = `${LIBRARY}/${OFFICIAL_HF_ORG}/microduck-policies/v1`;
 const OFFICIAL_DEFAULTS: Record<PolicySlot, string> = {
-  walk: "alpha_walking.onnx",
-  stand: "alpha_stand.onnx",
-  sitstand: "alpha_sitstand.onnx",
-  ground_pick: "alpha_ground_pick.onnx",
-  kick_left: "ball_kick_left.onnx",
-  kick_right: "ball_kick_right.onnx",
-  roulade: "roulade.onnx",
+  walk: `${OFFICIAL_SET}/alpha_walking.onnx`,
+  stand: `${OFFICIAL_SET}/alpha_stand.onnx`,
+  sitstand: `${OFFICIAL_SET}/alpha_sitstand.onnx`,
+  ground_pick: `${OFFICIAL_SET}/alpha_ground_pick.onnx`,
+  kick_left: `${OFFICIAL_SET}/ball_kick_left.onnx`,
+  kick_right: `${OFFICIAL_SET}/ball_kick_right.onnx`,
+  roulade: `${OFFICIAL_SET}/roulade.onnx`,
 };
-const OFFICIAL_SET_VERSION = "1.2.0";
+/** The one-shot skills `robot.do` answers to on an untouched robot (§10). */
+const BUILT_IN_SKILLS = ["roulade", "kick_left", "kick_right", "ground_pick", "sit_toggle"];
+
+/** Origin by the library path, the way the daemon decides it (§9.2: the org is in the path). */
+const originOfPath = (path: string): string =>
+  !path.startsWith(LIBRARY + "/") ? "local" : path.startsWith(`${LIBRARY}/${OFFICIAL_HF_ORG}/`) ? "official" : "community";
 
 /** upstream duck_control::model::battery_percent: 6.6 V empty, 8.2 V full. */
 const batteryPercent = (v: number) => Math.max(0, Math.min(1, (v - 6.6) / (8.2 - 6.6))) * 100;
@@ -46,8 +61,9 @@ export class MockTransport implements DuckTransport {
   private lastSampleAt = Date.now();
   /**
    * Per-slot overrides, exactly as robotd holds them: a slot missing from this
-   * map is a config key that was never written, which resolves to the official
-   * default (§3). `reset` deletes; it does not write a default back.
+   * map is a config key that was never written, which resolves to the mode's
+   * default (§3). `reset` deletes; it does not write a default back. The value
+   * is the `path` as sent, "none" included.
    */
   private overrides = new Map<PolicySlot, string>();
 
@@ -94,29 +110,66 @@ export class MockTransport implements DuckTransport {
         this.vel = { vx: 0, vy: 0, vyaw: 0 };
         return { accepted: true, mock: true };
       case M.robotPolicies:
-        return { api_version: 17, slots: this.policyRows(), mock: true };
+        return this.policies();
       case M.robotLoadPolicy: {
-        const slot = String(params?.slot ?? "") as PolicySlot;
-        if (!(POLICY_SLOTS as readonly string[]).includes(slot)) {
-          throw new Error(`no such policy slot: ${slot}`);
+        // Upstream's LoadPolicyParams is deny_unknown_fields: the daemon
+        // rejects a request spelled with anything but slot/path outright.
+        for (const k of Object.keys(params ?? {})) {
+          if (k !== "slot" && k !== "path") throw new Error(`robot.loadPolicy: unknown field \`${k}\``);
         }
-        const source = params?.source;
-        // A request that is already true does no work (§4) — the same answer
-        // robot.setMode gives for "already in that mode", and for the same
-        // reason: the caller asked for a state and has it. Without it, a reset
-        // on an untouched robot homes the duck and rebuilds seven sessions to
-        // arrive back where it started, which reads as a fault.
-        if (source === null || source === undefined) {
-          const had = this.overrides.delete(slot);
-          return { accepted: true, slot, queued: had, note: had ? "override removed" : "slot was not overridden", mock: true };
+        const slot = params?.slot as string | undefined;
+        const path = params?.path as string | undefined;
+        if (slot === undefined && path !== undefined) {
+          return { accepted: false, reason: "a path needs a slot; omit both to reset every slot to its default" };
         }
-        const src = String(source);
-        if (this.overrides.get(slot) === src) {
-          return { accepted: true, slot, queued: false, note: "already loaded", mock: true };
+        if (slot !== undefined && !(POLICY_SLOTS as readonly string[]).includes(slot)) {
+          return { accepted: false, reason: `no policy slot named "${slot}"; expected one of ${POLICY_SLOTS.join(", ")}` };
         }
-        this.overrides.set(slot, src);
-        return { accepted: true, slot, source: src, queued: true, mock: true };
+        if (slot === undefined) {
+          this.overrides.clear();
+          return { accepted: true, mock: true };
+        }
+        const s = slot as PolicySlot;
+        if (path === undefined) {
+          this.overrides.delete(s);
+          return { accepted: true, mock: true };
+        }
+        if (path === POLICY_NONE && s === "walk") {
+          return { accepted: false, reason: "walk cannot be \"none\": it is the slot every other slot falls back to" };
+        }
+        if (path !== POLICY_NONE && !path.startsWith("/")) {
+          return { accepted: false, reason: `"${path}" is not absolute; the daemon resolves nothing relative` };
+        }
+        this.overrides.set(s, path);
+        return { accepted: true, mock: true };
       }
+      case M.policyFetch: {
+        const repo = String(params?.repo ?? "");
+        const [org, name] = repo.split("/");
+        if (!org || !name) throw new Error(`policy.fetch: repo must be org/name, got "${repo}"`);
+        const revision = String(params?.revision ?? "main");
+        const file = String(params?.file ?? "policy.onnx");
+        return {
+          path: `${LIBRARY}/${org}/${name}/${revision}/${file}`,
+          repo,
+          revision,
+          commit: "0123abcd",
+          file,
+          origin: org === OFFICIAL_HF_ORG ? "official" : "community",
+          name,
+          description: "mock fetch — nothing was downloaded",
+          kind: "perpetual",
+          mock: true,
+        };
+      }
+      case M.policySearch:
+        return {
+          models: [
+            { id: `${OFFICIAL_HF_ORG}/microduck-policies`, origin: "official", likes: 42, downloads: 1200 },
+            { id: "RemiFabre/microduck-flamingo-cycle", origin: "community", likes: 7, downloads: 90 },
+          ].filter((m) => m.id.toLowerCase().includes(String(params?.query ?? "").toLowerCase())),
+          mock: true,
+        };
       case M.robotState:
         return this.state();
       case M.systemInfo:
@@ -131,37 +184,17 @@ export class MockTransport implements DuckTransport {
     }
   }
 
-  /**
-   * One row per slot. Origin is read off the source string by §2's rule — the
-   * same `parseSource` the real tools use, so the mock cannot disagree with
-   * them — and the version is rendered by what the publisher offers (§6):
-   * official policies get the set's semver, HF ones their revision, local
-   * ones `local`.
-   */
-  private policyRows(): PolicyEntry[] {
-    return POLICY_SLOTS.map((slot) => {
+  /** `robot.policies`, shaped like upstream's PoliciesResult. */
+  private policies(): PoliciesResult & { mock: true } {
+    const slots: PolicySlotRow[] = POLICY_SLOTS.map((slot) => {
       const override = this.overrides.get(slot);
       if (override === undefined) {
-        return {
-          slot,
-          policy: OFFICIAL_DEFAULTS[slot],
-          source: `pollen-robotics/microduck-policies`,
-          origin: "official" as const,
-          version: OFFICIAL_SET_VERSION,
-        };
+        return { slot, path: OFFICIAL_DEFAULTS[slot], origin: "official", overridden: false };
       }
-      const parsed = parseSource(override);
-      if (parsed.kind === "none") {
-        return { slot, policy: null, source: "none", origin: "local" as const, version: null };
-      }
-      return {
-        slot,
-        policy: parsed.kind === "hf" ? `${parsed.repo}:policy.onnx` : override,
-        source: override,
-        origin: parsed.origin,
-        version: parsed.kind === "hf" ? parsed.rev : parsed.kind === "path" ? "local" : null,
-      };
+      if (override === POLICY_NONE) return { slot, overridden: true };
+      return { slot, path: override, origin: originOfPath(override), overridden: true };
     });
+    return { mode: "walk", enabled: true, slots, skills: BUILT_IN_SKILLS, mock: true };
   }
 
   async state(): Promise<RobotState> {

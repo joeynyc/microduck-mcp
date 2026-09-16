@@ -1,20 +1,12 @@
 import { test, describe, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import {
-  ManifestFetcher,
-  checkManifest,
-  listPolicies,
-  loadPolicy,
-  originOf,
-  parseSource,
-  resetPolicy,
-} from "../policy.js";
+import { listPolicies, loadPolicy, originOf, parseSource, resetPolicy, searchPolicies } from "../policy.js";
 import { POLICY_SLOTS } from "../transport/protocol.js";
 import { MockTransport } from "../transport/mock.js";
 import { SimTransport } from "../transport/sim.js";
 import { DuckTransport } from "../transport/types.js";
 
-/** Transport stub: records every policy call, answers whatever it is given. */
+/** Transport stub: records every call, answers whatever it is given. */
 function stub(answers: Record<string, unknown> = {}): DuckTransport & {
   calls: { method: string; params?: Record<string, unknown> }[];
 } {
@@ -30,6 +22,9 @@ function stub(answers: Record<string, unknown> = {}): DuckTransport & {
         if (a instanceof Error) throw a;
         return a;
       }
+      if (method === "policy.fetch") {
+        return { path: `/var/lib/robot/policies/${params!.repo}/${params!.revision ?? "main"}/policy.onnx`, origin: "community" };
+      }
       return { accepted: true };
     },
     async ping() {
@@ -38,9 +33,6 @@ function stub(answers: Record<string, unknown> = {}): DuckTransport & {
     async close() {},
   };
 }
-
-/** A fetcher that hands back one manifest, or none at all. */
-const manifests = (m?: Record<string, unknown>): ManifestFetcher => async () => m as any;
 
 describe("the origin rule", () => {
   test("pollen-robotics is official — and only that org", () => {
@@ -57,202 +49,140 @@ describe("the origin rule", () => {
     assert.equal(originOf("apirrone/microduck_runtime@5f3b314"), "community");
   });
 
-  test("a path on the board is local", () => {
+  test("an absolute path on the board is local", () => {
     assert.equal(originOf("/home/radxa/policies/flamingo/policy.onnx"), "local");
-    assert.equal(originOf("~/policies/try.onnx"), "local");
-    assert.equal(originOf("./out/policy.onnx"), "local");
-    assert.equal(originOf("policy.onnx"), "local");
+    assert.equal(originOf("none"), "local");
   });
 
-  test("a bare library name claims nothing — the daemon knows, we do not", () => {
-    assert.equal(originOf("flamingo-cycle"), "unknown");
-    assert.equal(parseSource("flamingo-cycle").kind, "library");
+  test("a relative path is refused with the reason, not sent for the daemon to reject", () => {
+    for (const s of ["~/policies/try.onnx", "./out/policy.onnx", "policy.onnx"]) {
+      assert.throws(() => parseSource(s), /not absolute/);
+    }
   });
 
-  test("the revision travels with the repo, defaulting to main", () => {
-    assert.deepEqual(
-      { ...parseSource("RemiFabre/microduck-flamingo-cycle@bouncy-2") },
-      {
-        kind: "hf",
-        origin: "community",
-        repo: "RemiFabre/microduck-flamingo-cycle",
-        org: "RemiFabre",
-        name: "microduck-flamingo-cycle",
-        rev: "bouncy-2",
-      },
-    );
-    assert.equal(parseSource("RemiFabre/microduck-flamingo-cycle").rev, "main");
+  test("anything else is not a source", () => {
+    assert.throws(() => parseSource("flamingo-cycle"), /not a policy source/);
+    assert.throws(() => parseSource("a/b/c"), /not a policy source/);
+  });
+
+  test("the revision travels with the repo", () => {
+    assert.deepEqual(parseSource("RemiFabre/microduck-flamingo-cycle@bouncy-2"), {
+      kind: "hf",
+      origin: "community",
+      repo: "RemiFabre/microduck-flamingo-cycle",
+      org: "RemiFabre",
+      name: "microduck-flamingo-cycle",
+      rev: "bouncy-2",
+    });
+    const noRev = parseSource("RemiFabre/microduck-flamingo-cycle");
+    assert.equal(noRev.kind === "hf" ? noRev.rev : "?", undefined, "the daemon defaults to main");
   });
 });
 
 describe("walk can never be switched off", () => {
   test("walk = none is refused with a reason, before any wire traffic", async () => {
     const t = stub();
-    await assert.rejects(
-      () => loadPolicy(t, "walk", "none", manifests()),
-      /walk cannot be set to "none"/,
-    );
+    await assert.rejects(() => loadPolicy(t, "walk", "none"), /walk cannot be set to "none"/);
     assert.deepEqual(t.calls, [], "nothing reached the daemon");
   });
 
-  test("every other slot may be switched off", async () => {
+  test("every other slot may be switched off, as path 'none'", async () => {
     for (const slot of POLICY_SLOTS.filter((s) => s !== "walk")) {
       const t = stub();
-      const r = await loadPolicy(t, slot, "none", manifests());
-      assert.equal(r.source, "none");
-      assert.deepEqual(t.calls[0].params, { slot, source: "none" });
-    }
-  });
-});
-
-describe("the manifest pre-check", () => {
-  const repo = parseSource("RemiFabre/microduck-flamingo-cycle");
-
-  test("refuses a 51-D policy by naming both widths", async () => {
-    const v = await checkManifest(repo, manifests({ obs_len: 51, action_len: 14, model_api: 1 }));
-    assert.equal(v.ok, false);
-    assert.match(v.reason!, /observation width 51.*builds 61/);
-  });
-
-  test("refuses a wrong action width", async () => {
-    const v = await checkManifest(repo, manifests({ obs_len: 61, action_len: 12 }));
-    assert.equal(v.ok, false);
-    assert.match(v.reason!, /action width 12/);
-  });
-
-  test("refuses a policy that needs a newer daemon", async () => {
-    const v = await checkManifest(repo, manifests({ obs_len: 61, action_len: 14, model_api: 2 }));
-    assert.equal(v.ok, false);
-    assert.match(v.reason!, /model_api 2/);
-  });
-
-  test("an older model_api is not a refusal — only a newer one is", async () => {
-    assert.equal((await checkManifest(repo, manifests({ model_api: 0 }))).ok, true);
-  });
-
-  test("a matching manifest passes, and is never treated as a blessing", async () => {
-    const v = await checkManifest(repo, manifests({ obs_len: 61, action_len: 14, model_api: 1 }));
-    assert.equal(v.ok, true);
-    assert.equal(v.absent, false);
-  });
-
-  // ABSENCE IS NOT EVIDENCE (§9.2). Most of the Hub publishes no manifest of
-  // ours, so every one of these must LOAD, not refuse.
-  test("a repo with no manifest still loads", async () => {
-    const v = await checkManifest(repo, manifests(undefined));
-    assert.equal(v.ok, true);
-    assert.equal(v.absent, true);
-  });
-
-  test("a manifest omitting the fields we act on still loads", async () => {
-    const v = await checkManifest(repo, manifests({ name: "flamingo-cycle", kind: "perpetual" }));
-    assert.equal(v.ok, true);
-    assert.equal(v.absent, true);
-  });
-
-  test("fields of the wrong type read as absent, not as a contradiction", async () => {
-    const v = await checkManifest(repo, manifests({ obs_len: "61", action_len: null }));
-    assert.equal(v.ok, true);
-  });
-
-  test("an unreachable Hub still loads — a network fault is not a claim", async () => {
-    const v = await checkManifest(repo, async () => {
-      throw new Error("getaddrinfo ENOTFOUND huggingface.co");
-    });
-    assert.equal(v.ok, true);
-    assert.equal(v.absent, true);
-  });
-
-  test("a path and a library name have no manifest to read and are accepted", async () => {
-    for (const s of ["/home/radxa/policies/x.onnx", "flamingo-cycle"]) {
-      assert.equal((await checkManifest(parseSource(s), manifests({ obs_len: 51 }))).ok, true);
+      const r = await loadPolicy(t, slot, "none");
+      assert.equal(r.path, "none");
+      assert.deepEqual(t.calls, [{ method: "robot.loadPolicy", params: { slot, path: "none" } }]);
     }
   });
 });
 
 describe("loadPolicy", () => {
-  test("a bad manifest stops the load before the daemon is called", async () => {
+  test("a Hub repo is fetched on updaterd, then the returned path is loaded on robotd", async () => {
     const t = stub();
-    await assert.rejects(
-      () => loadPolicy(t, "walk", "RemiFabre/legacy-51d", manifests({ obs_len: 51 })),
-      /Refused before downloading.*observation width 51/s,
-    );
-    assert.deepEqual(t.calls, []);
-  });
-
-  test("a missing manifest loads, reports community, and says why it was accepted", async () => {
-    const t = stub();
-    const r = await loadPolicy(t, "walk", "RemiFabre/microduck-flamingo-cycle", manifests(undefined));
-    assert.equal(r.origin, "community");
-    assert.equal(r.manifest_checked, false);
-    assert.match(r.note!, /absence is not evidence/);
+    const r = await loadPolicy(t, "walk", "RemiFabre/microduck-flamingo-cycle@bouncy-2");
     assert.deepEqual(t.calls, [
-      { method: "robot.loadPolicy", params: { slot: "walk", source: "RemiFabre/microduck-flamingo-cycle" } },
+      { method: "policy.fetch", params: { repo: "RemiFabre/microduck-flamingo-cycle", revision: "bouncy-2" } },
+      {
+        method: "robot.loadPolicy",
+        params: { slot: "walk", path: "/var/lib/robot/policies/RemiFabre/microduck-flamingo-cycle/bouncy-2/policy.onnx" },
+      },
     ]);
+    assert.equal(r.origin, "community");
+    assert.equal(r.fetched?.path, r.path);
   });
 
-  test("origin is reported on the load itself, not only by list", async () => {
-    const official = await loadPolicy(stub(), "stand", "pollen-robotics/microduck-stand", manifests());
-    assert.equal(official.origin, "official");
-    const local = await loadPolicy(stub(), "stand", "/home/radxa/p.onnx", manifests());
-    assert.equal(local.origin, "local");
+  test("no revision means none is sent — the daemon's default is main", async () => {
+    const t = stub();
+    await loadPolicy(t, "walk", "pollen-robotics/microduck-walk");
+    assert.deepEqual(t.calls[0].params, { repo: "pollen-robotics/microduck-walk" });
   });
 
-  test("a v16 daemon's METHOD_NOT_FOUND becomes 'your daemon is too old'", async () => {
+  test("the daemon's origin is believed over ours", async () => {
+    const t = stub({ "policy.fetch": { path: "/var/lib/robot/policies/x/y/main/policy.onnx", origin: "official" } });
+    assert.equal((await loadPolicy(t, "stand", "x/y")).origin, "official");
+  });
+
+  test("an absolute path skips the fetch and is loaded as-is", async () => {
+    const t = stub();
+    const r = await loadPolicy(t, "stand", "/home/radxa/p.onnx");
+    assert.equal(r.origin, "local");
+    assert.equal(r.fetched, undefined);
+    assert.deepEqual(t.calls, [{ method: "robot.loadPolicy", params: { slot: "stand", path: "/home/radxa/p.onnx" } }]);
+  });
+
+  test("only slot and path ever go on the wire (LoadPolicyParams is deny_unknown_fields)", async () => {
+    const t = stub();
+    await loadPolicy(t, "stand", "/home/radxa/p.onnx");
+    await resetPolicy(t, "stand");
+    await resetPolicy(t);
+    for (const c of t.calls) {
+      assert.ok(Object.keys(c.params ?? {}).every((k) => k === "slot" || k === "path"), JSON.stringify(c));
+    }
+  });
+
+  test("a refused load is raised with the daemon's reason", async () => {
+    const t = stub({ "robot.loadPolicy": { accepted: false, reason: "obs[1,51] does not match [1,61]" } });
+    await assert.rejects(() => loadPolicy(t, "walk", "/home/radxa/legacy.onnx"), /refused: obs\[1,51\]/);
+  });
+
+  test("a fetch failure stops before robotd is asked anything", async () => {
+    const t = stub({ "policy.fetch": new Error("refused: repo carries two .onnx files") });
+    await assert.rejects(() => loadPolicy(t, "walk", "someone/two-files"), /two \.onnx files/);
+    assert.equal(t.calls.length, 1);
+  });
+
+  test("an old daemon's METHOD_NOT_FOUND becomes 'your daemon is too old'", async () => {
     const t = stub({ "robot.loadPolicy": new Error("method not found: robot.loadPolicy (code -32601)") });
-    await assert.rejects(
-      () => loadPolicy(t, "walk", "pollen-robotics/microduck-walk", manifests()),
-      /daemon is too old.*API_VERSION 17/s,
-    );
-  });
-
-  test("an ordinary refusal is passed through untouched", async () => {
-    const t = stub({ "robot.loadPolicy": new Error("refused: repo carries two .onnx files") });
-    await assert.rejects(
-      () => loadPolicy(t, "walk", "pollen-robotics/microduck-walk", manifests()),
-      /two \.onnx files/,
-    );
+    await assert.rejects(() => loadPolicy(t, "walk", "/home/radxa/p.onnx"), /daemon is too old.*API_VERSION 18/s);
   });
 });
 
 describe("resetPolicy", () => {
-  test("one slot removes exactly one config key", async () => {
+  test("one slot is the same method with no path", async () => {
     const t = stub();
     const r = await resetPolicy(t, "stand");
     assert.deepEqual(r.reset, ["stand"]);
-    assert.deepEqual(t.calls, [{ method: "robot.loadPolicy", params: { slot: "stand", source: null } }]);
+    assert.deepEqual(t.calls, [{ method: "robot.loadPolicy", params: { slot: "stand" } }]);
   });
 
-  test("no slot resets all seven, in upstream's order", async () => {
+  test("no slot is one call with neither field — 'put it all back'", async () => {
     const t = stub();
     const r = await resetPolicy(t);
     assert.deepEqual(r.reset, [...POLICY_SLOTS]);
-    assert.deepEqual(
-      t.calls.map((c) => c.params?.slot),
-      [...POLICY_SLOTS],
-    );
-    assert.ok(t.calls.every((c) => c.params?.source === null), "reset removes the key; it names no file");
+    assert.deepEqual(t.calls, [{ method: "robot.loadPolicy", params: {} }]);
   });
 });
 
-describe("listPolicies", () => {
-  test("fills in an origin the daemon did not report, by the same rule", async () => {
-    const t = stub({
-      "robot.policies": [
-        { slot: "walk", policy: "flamingo", source: "RemiFabre/microduck-flamingo-cycle" },
-        { slot: "stand", policy: "alpha_stand.onnx", source: "pollen-robotics/microduck-policies" },
-        { slot: "roulade", policy: "x.onnx", source: "/home/radxa/x.onnx" },
-      ],
-    });
-    assert.deepEqual(
-      (await listPolicies(t)).map((r) => r.origin),
-      ["community", "official", "local"],
-    );
+describe("listPolicies / searchPolicies", () => {
+  test("list passes the daemon's PoliciesResult through", async () => {
+    const answer = { mode: "walk", enabled: true, slots: [{ slot: "walk", path: "/x", origin: "official", overridden: false }], skills: ["bow"] };
+    assert.deepEqual(await listPolicies(stub({ "robot.policies": answer })), answer);
   });
 
-  test("a daemon that reports its own origin is believed", async () => {
-    const t = stub({ "robot.policies": { slots: [{ slot: "walk", origin: "official", source: "whatever" }] } });
-    assert.equal((await listPolicies(t))[0].origin, "official");
+  test("search asks updaterd and unwraps the models", async () => {
+    const t = stub({ "policy.search": { models: [{ id: "a/b", origin: "community" }] } });
+    assert.deepEqual(await searchPolicies(t, "duck"), [{ id: "a/b", origin: "community" }]);
+    assert.deepEqual(t.calls, [{ method: "policy.search", params: { query: "duck" } }]);
   });
 });
 
@@ -262,47 +192,59 @@ describe("MockTransport policy channel", () => {
     m = new MockTransport();
   });
 
-  test("all seven slots start on the official set", async () => {
-    const rows = await listPolicies(m);
-    assert.deepEqual(rows.map((r) => r.slot), [...POLICY_SLOTS]);
-    assert.ok(rows.every((r) => r.origin === "official"), "an untouched robot is entirely official");
-    assert.equal(rows.find((r) => r.slot === "walk")!.policy, "alpha_walking.onnx");
+  test("all seven slots start on the official set, nothing overridden", async () => {
+    const r = await listPolicies(m);
+    assert.deepEqual(r.slots.map((s) => s.slot), [...POLICY_SLOTS]);
+    assert.ok(r.slots.every((s) => s.origin === "official" && !s.overridden));
+    assert.match(r.slots[0].path!, /alpha_walking\.onnx$/);
+    assert.ok(r.skills!.includes("sit_toggle"));
   });
 
-  test("a load shows up in the list with its origin and revision", async () => {
-    await loadPolicy(m, "walk", "RemiFabre/microduck-flamingo-cycle@bouncy-2", manifests());
-    const walk = (await listPolicies(m)).find((r) => r.slot === "walk")!;
+  test("a load shows up in the list with its origin and library path", async () => {
+    await loadPolicy(m, "walk", "RemiFabre/microduck-flamingo-cycle@bouncy-2");
+    const walk = (await listPolicies(m)).slots.find((s) => s.slot === "walk")!;
     assert.equal(walk.origin, "community");
-    assert.equal(walk.version, "bouncy-2");
-    assert.equal(walk.policy, "RemiFabre/microduck-flamingo-cycle:policy.onnx");
+    assert.equal(walk.overridden, true);
+    assert.equal(walk.path, "/var/lib/robot/policies/RemiFabre/microduck-flamingo-cycle/bouncy-2/policy.onnx");
   });
 
   test("reset puts the official policy back", async () => {
-    await loadPolicy(m, "stand", "none", manifests());
-    assert.equal((await listPolicies(m)).find((r) => r.slot === "stand")!.policy, null);
+    await loadPolicy(m, "stand", "none");
+    assert.equal((await listPolicies(m)).slots.find((s) => s.slot === "stand")!.path, undefined);
     await resetPolicy(m, "stand");
-    const stand = (await listPolicies(m)).find((r) => r.slot === "stand")!;
-    assert.equal(stand.policy, "alpha_stand.onnx");
-    assert.equal(stand.origin, "official");
+    const stand = (await listPolicies(m)).slots.find((s) => s.slot === "stand")!;
+    assert.match(stand.path!, /alpha_stand\.onnx$/);
+    assert.equal(stand.overridden, false);
   });
 
-  test("a request already satisfied queues no work (§4)", async () => {
-    const untouched = (await m.call("robot.loadPolicy", { slot: "roulade", source: null })) as any;
-    assert.equal(untouched.queued, false);
-    await loadPolicy(m, "roulade", "someone/roulade", manifests());
-    const again = (await m.call("robot.loadPolicy", { slot: "roulade", source: "someone/roulade" })) as any;
-    assert.equal(again.queued, false);
+  test("reset with no slot clears every override in one call", async () => {
+    await loadPolicy(m, "stand", "/home/radxa/a.onnx");
+    await loadPolicy(m, "roulade", "/home/radxa/b.onnx");
+    await resetPolicy(m);
+    assert.ok((await listPolicies(m)).slots.every((s) => !s.overridden));
   });
 
-  test("an unknown slot is refused", async () => {
-    await assert.rejects(() => m.call("robot.loadPolicy", { slot: "backflip", source: "x" }), /no such policy slot/);
+  test("the mock is as strict as the daemon about the params shape", async () => {
+    await assert.rejects(() => m.call("robot.loadPolicy", { slot: "walk", source: "x" }), /unknown field `source`/);
+    const noSlot = (await m.call("robot.loadPolicy", { path: "/x.onnx" })) as any;
+    assert.equal(noSlot.accepted, false);
+    const badSlot = (await m.call("robot.loadPolicy", { slot: "backflip", path: "/x.onnx" })) as any;
+    assert.match(badSlot.reason, /no policy slot named "backflip"/);
+    const relative = (await m.call("robot.loadPolicy", { slot: "walk", path: "x.onnx" })) as any;
+    assert.match(relative.reason, /not absolute/);
+  });
+
+  test("search is served from updaterd's namespace", async () => {
+    const hits = await searchPolicies(m, "flamingo");
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].origin, "community");
   });
 });
 
 describe("SimTransport policy channel", () => {
   test("says it is unsupported rather than inventing slots", async () => {
     const t = new SimTransport({ python: process.execPath, script: "/nonexistent" });
-    for (const method of ["robot.policies", "robot.loadPolicy"]) {
+    for (const method of ["robot.policies", "robot.loadPolicy", "policy.fetch", "policy.search"]) {
       await assert.rejects(() => t.call(method), /not supported on the sim transport/);
     }
     await t.close();

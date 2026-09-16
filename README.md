@@ -68,8 +68,9 @@ Or for Claude Code: `claude mcp add microduck -e DUCK_TRANSPORT=mock -- node /pa
 | `duck_updates` | Installed releases | read-only |
 | `duck_monitor` | One-shot state: joints, gravity, gyro, odometry, current intent | read-only |
 | `duck_camera` | PNG frame: head camera or follow/front/side/top view (sim today) | read-only |
-| `duck_policy_list` | Which ONNX policy fills each of the seven slots, with origin (official / community / local) and version | read-only |
-| `duck_policy_load` | Put an HF repo, library entry or on-board `.onnx` in one slot; manifest pre-check can only refuse | gated like motion |
+| `duck_policy_list` | Which `.onnx` fills each of the seven slots, with origin (official / community / local), plus the robot's skills | read-only |
+| `duck_policy_search` | Hugging Face models matching a query | read-only |
+| `duck_policy_load` | Fetch an HF repo into the robot's library and swap it into one slot, or load an on-board `.onnx` | gated like motion |
 | `duck_policy_reset` | Remove the override on one slot (or all seven) — the one-word undo for a load | gated like motion |
 | `duck_walk` | Velocity intent (vx/vy/wz) for `duration_s`, then auto-stops | clamped, battery-gated, rate-limited |
 | `duck_behavior` | sit / stand / getup / pickup / kick / roulade / quack | gated (quack is free; getup allowed while fallen) |
@@ -102,7 +103,7 @@ and rolls; it just isn't a speed benchmark.
 
 ## Ecosystem
 
-- [MicroduckHub](https://microduckhub.com) — DuckHub, the community policy browser this server will back once upstream's M8 model channel ships.
+- [MicroduckHub](https://microduckhub.com) — DuckHub, the community policy browser this server backs through upstream's policy channel (daemon 0.13+).
 - [awesome-microduck](https://github.com/joeynyc/awesome-microduck) — the curated ecosystem list.
 
 ## Not an official project

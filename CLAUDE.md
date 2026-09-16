@@ -43,24 +43,32 @@ sessions on this repo.
    An agent auto-updating robot firmware is a footgun; revisit once the M8
    Hub policy channel ships, because that's when it becomes DuckHub's deploy
    backend (see sibling repo `duckhub`).
-5. **Policy channel: load + reset only** (`src/policy.ts`, upstream's
-   `policy-channel-design.md`). `duck_policy_list` / `duck_policy_load` /
-   `duck_policy_reset`. `policy update` and `policy check` are excluded by the
-   same rule as (4): nothing that fetches "the newest" and applies it. Load and
-   reset are the safe pair because reset is a one-word undo, and a load is a
-   config edit that survives a reboot (§3) so it needs one. Needs upstream
-   API_VERSION 17; a v16 daemon's METHOD_NOT_FOUND is translated into "your
-   daemon is too old". Origin (`pollen-robotics/*` official, any other HF repo
-   community, a path local) is a constant in `protocol.ts` and never a config
-   key. `walk = "none"` is refused: everything falls back to it. The HF
-   `manifest.json` pre-check can only REFUSE (wrong obs/action width, newer
-   `model_api`) — a missing or partial manifest still loads, because most of
-   the Hub publishes none and robotd's shape gate is the real check.
+5. **Policy channel: list + search + load + reset** (`src/policy.ts`, upstream's
+   `policy-channel-design.md`, shipped in daemon 0.13 = API_VERSION 18–20).
+   `duck_policy_list` / `duck_policy_search` / `duck_policy_load` /
+   `duck_policy_reset`. `policy.check` and `policy.install` (the official set's
+   update path) are excluded by the same rule as (4): nothing that fetches "the
+   newest" and applies it. Load and reset are the safe pair because reset is a
+   one-word undo, and a load is a config edit that survives a reboot (§3) so it
+   needs one. On the wire a load of a Hub repo is `policy.fetch` (updaterd,
+   downloads into `/var/lib/robot/policies/` and reads the manifest) then
+   `robot.loadPolicy {slot, path}` (robotd); an absolute path skips the fetch.
+   `LoadPolicyParams` is `deny_unknown_fields`: only `slot` and `path` ever go
+   on the wire. Reset = same method, no path; reset-all = neither field, one
+   call. An older daemon's METHOD_NOT_FOUND is translated into "your daemon is
+   too old". Origin (`pollen-robotics/*` official, any other HF repo community,
+   a path local) is decided by the daemon and reported back; our constant in
+   `protocol.ts` is only for what we say before asking. `walk = "none"` is
+   refused (by us first, by the daemon too). We do NOT read manifests
+   ourselves any more: `policy.fetch` answers with the daemon's reading of it.
 
 ## Wire protocol: upstream's, verbatim (since 2026-08-29)
 
-Upstream publishes the contract in `duck-ipc-proto/src/lib.rs` (commit
-590b986). **`src/transport/protocol.ts` is the only place method names and
+Upstream publishes the contract in `duck-ipc-proto/src/lib.rs`. Motion,
+health and state were verified at commit 590b986 (API_VERSION 16) and
+re-checked unchanged at 2703e09 (daemon 0.13.0, API_VERSION 28); the policy
+channel is written against 2703e09. The sim vendors 590b986 because the
+`.onnx` files left the repo for the Hub after it. **`src/transport/protocol.ts` is the only place method names and
 enum spellings live**; every transport, the sidecar and the tools use it.
 The shapes that needed adapting, and where the adapter is:
 
@@ -73,16 +81,21 @@ The shapes that needed adapting, and where the adapter is:
 | `duck_behavior quack`       | `robot.sound {tag:"chirp"}`                              | (what `robotctl quack` plays) |
 | battery floor               | `robot.health` → `battery:{volts,percent}`               | `preMotionCheck` reads `percent` |
 | `duck_monitor`              | `robot.subscribe {hz:50}` → first `robot.state` frame    | `DuckTransport.state()`: unix/ssh subscribe-and-take-one; sim/mock answer `robot.state` directly |
-| `duck_policy_list`          | `robot.policies`                                          | origin filled in from the source string when the daemon omits it |
-| `duck_policy_load`          | `robot.loadPolicy {slot, source}`                        | `policy.ts`: walk≠none, manifest pre-check, gated like motion (a load homes the robot and rebuilds all seven sessions) |
-| `duck_policy_reset`         | `robot.loadPolicy {slot, source: null}`                  | null = remove the config key (§3); no slot = all seven |
+| `duck_policy_list`          | `robot.policies` → `{mode, enabled, slots[{slot,path,origin,overridden,error}], skills, change_error}` | passed through |
+| `duck_policy_search`        | `policy.search {query}` (updaterd) → `{models[{id,origin,likes,downloads}]}` | unwrapped |
+| `duck_policy_load`          | HF repo: `policy.fetch {repo, revision?}` (updaterd) → `robot.loadPolicy {slot, path}`; path: just the load | `policy.ts`: walk≠none, gated like motion (a load homes the robot and rebuilds all seven sessions) |
+| `duck_policy_reset`         | `robot.loadPolicy {slot}` / `{}`                          | no path = remove the config key (§3); no slot = all seven in one call |
 | `duck_version`              | `system.info` (configd)                                  | |
 | `duck_updates`              | `update.listInstalled {component:"daemon"}`              | |
 
 Intents sent as *requests* (with an id) are answered with `IntentResult`
-(`robotd/src/main.rs:2682`), so no notification path is needed. Not exposed
+(`robotd/src/main.rs:2682`), so no notification path is needed;
+`robot.loadPolicy` answers the same way and a refusal is raised. Not exposed
 yet: `robot.head`, `robot.look`, `robot.pose`, `robot.mouth`, `robot.enable`,
-`robot.relax`, `robot.shutdown`, `robot.setMode`.
+`robot.relax`, `robot.shutdown`, `robot.setMode`, `robot.skills` /
+`robot.setSkill` (skills are config since v22; `robot.policies.skills` lists
+them), `media.frame` (v0.13: a JSON header then raw bytes on a fourth socket,
+`/run/mediad/media.sock` — the hardware `duck_camera` path, not wired yet).
 
 ## Sim transport (`DUCK_TRANSPORT=sim`)
 

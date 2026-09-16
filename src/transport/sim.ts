@@ -169,7 +169,7 @@ export class SimTransport implements DuckTransport {
     // library to fetch into, and no origin to report. Answering with a
     // plausible-looking slot table would be a lie about what is running, which
     // is precisely the confusion `robot.policies` exists to end — so refuse.
-    if (method === M.robotPolicies || method === M.robotLoadPolicy) {
+    if (method === M.robotPolicies || method === M.robotLoadPolicy || method.startsWith("policy.")) {
       return Promise.reject(
         new Error(
           `${method} is not supported on the sim transport: the sidecar runs a ` +

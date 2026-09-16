@@ -15,17 +15,21 @@ export const M = {
   robotSound: "robot.sound", // {tag, hold?}
   robotSubscribe: "robot.subscribe", // {hz?} → SubscribeResult, then robot.state notifications
   robotState: "robot.state", // notification (server → client); sidecars may also answer it one-shot
-  // robotd — the policy channel (policy-channel-design.md §8). NOTE: these two
-  // methods took upstream's API_VERSION from 16 to 17. A v16 daemon answers
-  // METHOD_NOT_FOUND naming the method — that is the designed skew behaviour,
-  // not a handshake refusal, so the tools turn it into "your daemon is too
-  // old" rather than surfacing a raw JSON-RPC error.
-  robotPolicies: "robot.policies", // → per-slot current policy, origin, version
-  robotLoadPolicy: "robot.loadPolicy", // {slot, source} — source null = reset (§3)
+  // robotd — the policy channel (policy-channel-design.md §8; API_VERSION 18).
+  // A v17-or-older daemon answers METHOD_NOT_FOUND naming the method — the
+  // designed skew behaviour, not a handshake refusal — so the tools turn it
+  // into "your daemon is too old" rather than surfacing a raw JSON-RPC error.
+  robotPolicies: "robot.policies", // → PoliciesResult
+  robotLoadPolicy: "robot.loadPolicy", // {slot?, path?} → IntentResult; no path = reset the slot, neither = reset all
   // configd
   systemInfo: "system.info",
   // updaterd
   updateListInstalled: "update.listInstalled", // {component}
+  // updaterd — the Hub side of the policy channel (v19). Deliberately NOT
+  // here: policy.check / policy.install, which fetch-and-apply "the newest"
+  // official set (CLAUDE.md "Deliberately excluded").
+  policyFetch: "policy.fetch", // {repo, revision?, file?} → PolicyFetchResult (downloads into the library)
+  policySearch: "policy.search", // {query} → {models: PolicySearchHit[]}
 } as const;
 
 /** `robot.do` skills. sit_toggle sits if standing, stands if sitting. */
@@ -51,57 +55,76 @@ export const POLICY_SLOTS = [
 export type PolicySlot = (typeof POLICY_SLOTS)[number];
 
 /**
- * The literal that switches a slot off (§9.2) — the same `[policy] <slot> =
- * "none"` a robotd.toml already accepts. Every slot but `walk`, which is what
- * the others fall back to and so can never be empty.
+ * The literal that switches a slot off (§9.2) — sent as the `path`, exactly
+ * as `[policy] <slot> = "none"` in robotd.toml. Every slot but `walk`, which
+ * is what the others fall back to and so can never be empty.
  */
 export const POLICY_NONE = "none";
+
+/** The API_VERSION that introduced robot.policies / robot.loadPolicy. */
+export const POLICY_API_VERSION = 18;
 
 /**
  * The HF org that makes a policy official (§2). Hardcoded on purpose and NOT
  * a config key: a robot that can be told which org to trust is a robot whose
- * "official" badge means nothing.
+ * "official" badge means nothing. The daemon applies the same rule and
+ * reports the origin itself; this constant is for what we can say before
+ * asking it.
  */
 export const OFFICIAL_HF_ORG = "pollen-robotics";
 
 /** Where a policy came from, which drives behaviour and not only a label (§2). */
-export type PolicyOrigin = "official" | "community" | "local" | "unknown";
+export type PolicyOrigin = "official" | "community" | "local";
 
-/**
- * The daemon's own contract, published in upstream's `duck_ipc_proto` and
- * asserted at compile time in `duck_control`: obs[1,61] f32 → actions[1,14]
- * f32, model_api 1. Mirrored here only so a manifest can be read against it
- * before 800 KB is downloaded; robotd's shape gate is still the real check.
- */
-export const POLICY_OBS_LEN = 61;
-export const POLICY_ACTION_LEN = 14;
-export const POLICY_MODEL_API = 1;
-
-/** One row of `robot.policies`. Fields we don't consume are left open. */
-export interface PolicyEntry {
+/** One row of `robot.policies` (upstream `PolicySlot`). */
+export interface PolicySlotRow {
   slot: string;
-  policy?: string | null;
-  origin?: PolicyOrigin;
-  version?: string | null;
-  source?: string | null;
+  /** The file running in it. Absent = the slot is empty (a capability this robot lacks, not a fault). */
+  path?: string | null;
+  /** "official" | "community" | "local"; absent when the slot is empty. A string on the wire. */
+  origin?: string | null;
+  /** Whether config overrides this slot rather than it resolving to the mode's default. */
+  overridden: boolean;
+  /** Why the slot is not running what was asked: the override failed and the default is running. */
   error?: string | null;
   [k: string]: unknown;
 }
 
-/**
- * `manifest.json` as published on the Hub (sharing-policies.md, schema v2).
- * Every field is optional here because the manifest is a stranger's claim
- * about a stranger's file: it may be absent, partial, or wrong.
- */
-export interface PolicyManifest {
-  schema_version?: number;
-  model_api?: number;
-  name?: string;
-  kind?: string;
-  obs_len?: number;
-  action_len?: number;
-  description?: string;
-  robot?: { model?: string; [k: string]: unknown };
+/** `robot.policies` (upstream `PoliciesResult`). Fields we don't consume are left open. */
+export interface PoliciesResult {
+  /** "walk" or "roller" — whose slot defaults are in play. */
+  mode: string;
+  /** `[policy] enabled`. False is a legitimate bench configuration, not a fault. */
+  enabled: boolean;
+  slots: PolicySlotRow[];
+  /** The one-shot skills this robot has (what `robot.do` answers to). Empty = "did not say". */
+  skills?: string[];
+  /** Why the last reload / whole-robot reset failed; cleared by the next success. */
+  change_error?: string | null;
+  [k: string]: unknown;
+}
+
+/** `policy.fetch` (upstream `PolicyFetchResult`). The manifest fields are the publisher's claims. */
+export interface PolicyFetchResult {
+  /** Where it landed in the library — what goes in the slot. */
+  path: string;
+  repo: string;
+  revision: string;
+  commit?: string | null;
+  file: string;
+  origin: string;
+  name?: string | null;
+  description?: string | null;
+  kind?: string | null;
+  [k: string]: unknown;
+}
+
+/** One `policy.search` hit. Everything here is written by whoever published it. */
+export interface PolicySearchHit {
+  id: string;
+  origin: string;
+  likes?: number | null;
+  downloads?: number | null;
   [k: string]: unknown;
 }
 

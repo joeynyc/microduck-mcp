@@ -77,7 +77,7 @@ export interface DuckTransport {
 /** Route a method namespace to the daemon that owns it (per architecture.md). */
 export function serviceFor(method: string): DuckService {
   if (method.startsWith("robot.")) return "robotd";
-  if (method.startsWith("update.")) return "updaterd";
+  if (method.startsWith("update.") || method.startsWith("policy.")) return "updaterd";
   // net.*, pad.*, system.* live on configd
   return "configd";
 }
