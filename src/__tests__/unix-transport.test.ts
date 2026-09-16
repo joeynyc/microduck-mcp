@@ -1,5 +1,6 @@
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
 import net from "node:net";
 import { createInterface } from "node:readline";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -7,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { UnixTransport } from "../transport/unix.js";
 import { SshTransport } from "../transport/ssh.js";
+import { pngSize } from "../transport/media.js";
 
 /**
  * Contract tests for UnixTransport against a fake robotd on a Unix socket:
@@ -16,7 +18,16 @@ import { SshTransport } from "../transport/ssh.js";
  */
 const dir = mkdtempSync(join(tmpdir(), "duck-unix-test-"));
 const sock = join(dir, "robotd.sock");
+const mediaSock = join(dir, "media.http.sock");
 let server: net.Server;
+let media: http.Server;
+
+/** A 2x1 RGB PNG, the shape mediad's /frame answers with (upright, image/png, no-store). */
+const TINY_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADklEQVR4nGP4z8DwHwAFAAH/1V/lqQAAAABJRU5ErkJggg==",
+  "base64",
+);
+let cameraUp = true;
 
 before(async () => {
   server = net.createServer((conn) => {
@@ -46,9 +57,21 @@ before(async () => {
     });
   });
   await new Promise<void>((r) => server.listen(sock, r));
+  // mediad's console, as forwarded over ssh: HTTP on a local Unix socket.
+  media = http.createServer((req, res) => {
+    if (req.url !== "/frame") return void res.writeHead(404).end();
+    if (!cameraUp) {
+      res.writeHead(503, { "content-type": "text/plain" });
+      return void res.end("Camera snapshot unavailable; retry when capture is running.\n");
+    }
+    res.writeHead(200, { "content-type": "image/png", "cache-control": "no-store" });
+    res.end(TINY_PNG);
+  });
+  await new Promise<void>((r) => media.listen(mediaSock, r));
 });
 after(async () => {
   await new Promise<void>((r) => server.close(() => r()));
+  await new Promise<void>((r) => media.close(() => r()));
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -94,6 +117,45 @@ describe("UnixTransport", () => {
   });
 });
 
+describe("UnixTransport camera (mediad /frame)", () => {
+  test("snapshot() is the console's upright PNG, with its real size", async () => {
+    const t = new UnixTransport(paths, 500, { socketPath: mediaSock });
+    const s = await t.snapshot!({ view: "head", width: 2, height: 1 });
+    assert.equal(Buffer.from(s.png_base64, "base64").equals(TINY_PNG), true);
+    assert.equal(s.width, 2);
+    assert.equal(s.height, 1);
+    assert.equal(s.view, "head");
+  });
+
+  test("a sim-only view or size is answered with the head camera and says so", async () => {
+    const t = new UnixTransport(paths, 500, { socketPath: mediaSock });
+    const s = await t.snapshot!({ view: "follow", width: 320, height: 240 });
+    assert.equal(s.view, "head");
+    assert.match(s.note!, /view='follow' is a sim-only/);
+    assert.match(s.note!, /320x240 not applied/);
+  });
+
+  test("mediad's 503 sentence is the error", async () => {
+    cameraUp = false;
+    try {
+      const t = new UnixTransport(paths, 500, { socketPath: mediaSock });
+      await assert.rejects(() => t.snapshot!({ view: "head", width: 1, height: 1 }), /HTTP 503 Camera snapshot unavailable/);
+    } finally {
+      cameraUp = true;
+    }
+  });
+
+  test("a console that is not there is a clear error, not a hang", async () => {
+    const t = new UnixTransport(paths, 500, { socketPath: join(dir, "no-console.sock") });
+    await assert.rejects(() => t.snapshot!({ view: "head", width: 1, height: 1 }), /mediad \/frame: .*ENOENT/);
+  });
+
+  test("pngSize reads IHDR and rejects non-PNG bytes", () => {
+    assert.deepEqual(pngSize(TINY_PNG), { width: 2, height: 1 });
+    assert.throws(() => pngSize(Buffer.from("<html>not a png</html>")), /not a PNG/);
+  });
+});
+
 describe("SshTransport", () => {
   test("a failed tunnel is forgotten, so the next call tries again", async () => {
     const t = new SshTransport("duck@nowhere", [], 2000, join(dir, "no-such-ssh"));
@@ -104,7 +166,7 @@ describe("SshTransport", () => {
     await t.close();
   });
 
-  test("forwards all three daemon sockets into the local dir", () => {
+  test("forwards all three daemon sockets and the console into the local dir", () => {
     const args = SshTransport.forwardArgs("duck@host", ["-o", "X=y"], "/tmp/d");
     assert.deepEqual(args, [
       "-N",
@@ -116,6 +178,8 @@ describe("SshTransport", () => {
       "/tmp/d/configd.sock:/run/configd.sock",
       "-L",
       "/tmp/d/updaterd.sock:/run/updaterd.sock",
+      "-L",
+      "/tmp/d/media.http.sock:127.0.0.1:8080",
       "duck@host",
     ]);
   });

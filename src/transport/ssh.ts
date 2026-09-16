@@ -2,7 +2,7 @@ import { spawn, ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { RobotState } from "./protocol.js";
+import { MEDIA, RobotState } from "./protocol.js";
 import { DuckService, DuckTransport, Snapshot, SnapshotRequest, pingViaHealth } from "./types.js";
 import { SOCKETS, UnixTransport } from "./unix.js";
 
@@ -10,9 +10,10 @@ import { SOCKETS, UnixTransport } from "./unix.js";
  * SSH transport — for running the MCP server on a laptop.
  *
  * Forwards the robot's three daemon sockets to local paths
- * (`ssh -N -L <tmp>/robotd.sock:/run/robotd.sock ...`) and speaks to them
- * through UnixTransport. Same protocol, same code path as on the robot; the
- * only ssh-specific part is the tunnel. (The v0 design shelled out to
+ * (`ssh -N -L <tmp>/robotd.sock:/run/robotd.sock ...`), plus mediad's console
+ * port to a local socket for the camera, and speaks to them through
+ * UnixTransport. Same protocol, same code path as on the robot; the only
+ * ssh-specific part is the tunnel. (The v0 design shelled out to
  * `robotctl`, which has no motion subcommands — a dead end for walking.)
  *
  * The tunnel is started lazily on the first call and re-established on the
@@ -41,11 +42,17 @@ export class SshTransport implements DuckTransport {
     };
   }
 
-  /** The ssh argv that forwards all three sockets into `dir`. */
+  /** Where mediad's console (TCP on the robot) lands locally: a Unix socket, so nothing binds a port. */
+  static mediaPath(dir: string): string {
+    return join(dir, "media.http.sock");
+  }
+
+  /** The ssh argv that forwards all three sockets and the console into `dir`. */
   static forwardArgs(host: string, sshArgs: string[], dir: string): string[] {
     const local = SshTransport.localPaths(dir);
     const forwards = (Object.keys(SOCKETS) as DuckService[]).flatMap((s) => ["-L", `${local[s]}:${SOCKETS[s]}`]);
-    return ["-N", ...sshArgs, ...forwards, host];
+    const media = ["-L", `${SshTransport.mediaPath(dir)}:127.0.0.1:${MEDIA.consolePort}`];
+    return ["-N", ...sshArgs, ...forwards, ...media, host];
   }
 
   /** True while a tunnel is up (or being brought up). Tests read this. */
@@ -72,10 +79,11 @@ export class SshTransport implements DuckTransport {
       };
       proc.on("error", (e) => fail(e.message));
       proc.on("exit", (code) => fail(`exited with code ${code}`));
+      const media = SshTransport.mediaPath(dir);
       const poll = setInterval(() => {
-        if (Object.values(local).every(existsSync)) {
+        if ([...Object.values(local), media].every(existsSync)) {
           clearInterval(poll);
-          resolve(new UnixTransport(local));
+          resolve(new UnixTransport(local, undefined, { socketPath: media }));
         } else if (Date.now() > deadline) {
           proc.kill();
           fail(`sockets not forwarded within ${this.readyTimeoutMs}ms`);
@@ -106,8 +114,10 @@ export class SshTransport implements DuckTransport {
     return pingViaHealth(this);
   }
 
-  // No snapshot: on hardware frames come from mediad's WebRTC stream (TODO).
-  declare snapshot?: (req: SnapshotRequest) => Promise<Snapshot>;
+  /** Head camera, through the forwarded console. */
+  async snapshot(req: SnapshotRequest): Promise<Snapshot> {
+    return (await this.start()).snapshot(req);
+  }
 
   async close(): Promise<void> {
     this.proc?.kill();

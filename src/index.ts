@@ -143,11 +143,11 @@ tool(
     title: "Duck camera",
     description:
       "A still frame of what the duck sees or looks like right now, returned " +
-      "as a PNG image. view='head' is the robot's own head camera; 'follow' " +
-      "(default), 'front', 'side' and 'top' are third-person views around the " +
-      "robot. Read-only, never moves the robot. Available on the sim " +
-      "transport today; on hardware it will come from mediad's WebRTC stream " +
-      "(not wired yet) and the mock transport returns a placeholder.",
+      "as a PNG image. view='head' is the robot's own head camera. 'follow' " +
+      "(default), 'front', 'side' and 'top' are third-person views that exist " +
+      "only in the simulator; on a real duck every view is the head camera at " +
+      "its native size, upright, and the result says so. Read-only, never " +
+      "moves the robot. The mock transport returns a placeholder.",
     inputSchema: {
       view: z
         .enum(["head", "follow", "front", "side", "top"])

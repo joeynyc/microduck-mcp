@@ -94,8 +94,21 @@ Intents sent as *requests* (with an id) are answered with `IntentResult`
 yet: `robot.head`, `robot.look`, `robot.pose`, `robot.mouth`, `robot.enable`,
 `robot.relax`, `robot.shutdown`, `robot.setMode`, `robot.skills` /
 `robot.setSkill` (skills are config since v22; `robot.policies.skills` lists
-them), `media.frame` (v0.13: a JSON header then raw bytes on a fourth socket,
-`/run/mediad/media.sock` — the hardware `duck_camera` path, not wired yet).
+them).
+
+**Camera on hardware** (`src/transport/media.ts`): `duck_camera` fetches
+`GET /frame` from mediad's console (`:8080`, always served) — mediad's own
+consumer of the raw `media.frame` socket, which does the hello handshake,
+the UYVY decode and the mount rotation and answers an upright `image/png`
+(503 + a sentence when capture is down). We deliberately do not speak
+`media.frame` itself (`/run/mediad/media.sock`, group `robot`, JSON header
+then raw UYVY): a picture for an agent needs none of the pixel work, and the
+console is where upstream put it. On the robot the endpoint is
+`127.0.0.1:8080` (`DUCK_MEDIA_PORT` overrides); over ssh it is forwarded to
+`<tmp>/media.http.sock` next to the daemon sockets, hence node:http with a
+`socketPath` rather than fetch. Hardware has one camera at native size: a
+sim-only `view` or a requested size is answered with the head camera and a
+note saying so.
 
 ## Sim transport (`DUCK_TRANSPORT=sim`)
 
@@ -137,7 +150,7 @@ them), `media.frame` (v0.13: a JSON header then raw bytes on a fourth socket,
 - [x] Verify RPC method names against upstream and speak them verbatim —
       done, `protocol.ts` + table above. Untested on hardware, obviously.
 - [x] `sim` transport: CPU MuJoCo + official ONNX policies (`sim/duck_sim.py`)
-- [x] `duck_camera` tool — sim renders; hardware path via mediad WebRTC still TODO
+- [x] `duck_camera` tool — sim renders; hardware via mediad's console `/frame` (fake-console tests only until Dec)
 - [ ] `duck_head` tool (`robot.head`) — sim already handles it
 - [ ] `duck_depth` tool — tofd's 8×8 matrix via `tof.stream` subscription
 - [x] `duck_monitor` — one-shot state sample (joints, gravity, odometry)
@@ -181,6 +194,6 @@ them), `media.frame` (v0.13: a JSON header then raw bytes on a fourth socket,
   dirs); `SshTransport` forgets a failed or dead tunnel so the next call
   reconnects.
 - Camera is a transport *capability* (`DuckTransport.snapshot?`), not an RPC
-  name: sim renders, mock returns a placeholder, unix/ssh have none until
-  mediad is wired.
+  name: sim renders, mock returns a placeholder, unix/ssh fetch mediad's
+  console `/frame` (see "Camera on hardware" above).
 - Tool descriptions state their safety behavior explicitly (agents read them).

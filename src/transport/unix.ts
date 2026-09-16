@@ -1,12 +1,15 @@
 import net from "node:net";
 import { createInterface } from "node:readline";
 import { M, RobotState } from "./protocol.js";
+import { MediaEndpoint, localConsole, mediaSnapshot } from "./media.js";
 import {
   DuckService,
   DuckTransport,
   JsonRpcNotification,
   JsonRpcRequest,
   JsonRpcResponse,
+  Snapshot,
+  SnapshotRequest,
   pingViaHealth,
   rpcErrorMessage,
   serviceFor,
@@ -24,6 +27,7 @@ type Inbound = JsonRpcResponse | JsonRpcNotification;
  * Direct Unix-socket transport — for running the MCP server on the robot
  * itself, or against sockets forwarded to other paths (see SshTransport).
  * Opens a connection per call; the protocol is one JSON object per line.
+ * The camera is mediad's console (`media` endpoint), not a daemon socket.
  */
 export class UnixTransport implements DuckTransport {
   private nextId = 1;
@@ -31,6 +35,7 @@ export class UnixTransport implements DuckTransport {
   constructor(
     private socketPaths: Record<DuckService, string> = SOCKETS,
     private timeoutMs = 5000,
+    private media: MediaEndpoint = localConsole(),
   ) {}
 
   call(method: string, params?: Record<string, unknown>): Promise<unknown> {
@@ -96,6 +101,11 @@ export class UnixTransport implements DuckTransport {
       sock.on("error", (e) => done(() => reject(e)));
       sock.on("close", () => done(() => reject(new Error(`${req.method}: connection closed without an answer`))));
     });
+  }
+
+  /** One upright PNG from the head camera (mediad `/frame`). */
+  snapshot(req: SnapshotRequest): Promise<Snapshot> {
+    return mediaSnapshot(this.media, req);
   }
 
   ping(): Promise<boolean> {

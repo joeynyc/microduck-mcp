@@ -21,6 +21,10 @@ export const M = {
   // into "your daemon is too old" rather than surfacing a raw JSON-RPC error.
   robotPolicies: "robot.policies", // → PoliciesResult
   robotLoadPolicy: "robot.loadPolicy", // {slot?, path?} → IntentResult; no path = reset the slot, neither = reset all
+  // mediad — a JSON header then raw UYVY bytes on /run/mediad/media.sock. Not
+  // called by this server: mediad's own console wraps it as an upright PNG
+  // (see MEDIA below), which is what duck_camera fetches on hardware.
+  mediaFrame: "media.frame",
   // configd
   systemInfo: "system.info",
   // updaterd
@@ -127,6 +131,20 @@ export interface PolicySearchHit {
   downloads?: number | null;
   [k: string]: unknown;
 }
+
+/**
+ * mediad's console (`mediad/src/web.rs`): always served, `--port 8080` by
+ * default, and `GET /frame` answers one `media.frame` as an upright PNG
+ * (`image/png`, `Cache-Control: no-store`; 503 with a sentence when capture
+ * is not running). It is mediad's own consumer of the raw socket — hello
+ * handshake, UYVY decode, mount rotation — so a client that wants a picture
+ * rather than a dataset asks here and never touches pixel formats.
+ */
+export const MEDIA = {
+  consolePort: 8080,
+  framePath: "/frame",
+  rawSocket: "/run/mediad/media.sock",
+} as const;
 
 /** The updater component that carries the daemons. */
 export const DAEMON_COMPONENT = "daemon";

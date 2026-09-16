@@ -67,7 +67,7 @@ Or for Claude Code: `claude mcp add microduck -e DUCK_TRANSPORT=mock -- node /pa
 | `duck_version` | Robot name, serial, uptime | read-only |
 | `duck_updates` | Installed releases | read-only |
 | `duck_monitor` | One-shot state: joints, gravity, gyro, odometry, current intent | read-only |
-| `duck_camera` | PNG frame: head camera or follow/front/side/top view (sim today) | read-only |
+| `duck_camera` | PNG frame: the head camera (hardware, via mediad) or follow/front/side/top views (sim) | read-only |
 | `duck_policy_list` | Which `.onnx` fills each of the seven slots, with origin (official / community / local), plus the robot's skills | read-only |
 | `duck_policy_search` | Hugging Face models matching a query | read-only |
 | `duck_policy_load` | Fetch an HF repo into the robot's library and swap it into one slot, or load an on-board `.onnx` | gated like motion |
@@ -90,8 +90,8 @@ is always available.
 |---|---|---|
 | `mock` (default) | Canned state, instant | nothing |
 | `sim` | Headless CPU MuJoCo running the official `alpha_*.onnx` policies with robotd's control chain, in a Python sidecar (`sim/duck_sim.py`) | `sim/setup.sh` |
-| `unix` | The robot's own daemons over `/run/*.sock` | running on the duck |
-| `ssh` | The same sockets forwarded over `ssh -L`, then `unix` | a duck on the network, ssh access |
+| `unix` | The robot's own daemons over `/run/*.sock`, camera from mediad's console on `:8080` | running on the duck |
+| `ssh` | The same sockets and the console forwarded over `ssh -L`, then `unix` | a duck on the network, ssh access |
 
 All four sit behind one `DuckTransport` interface, so the tools — and the
 safety layer — are identical whether the duck is simulated or real.
@@ -114,7 +114,8 @@ Community project — not affiliated with, endorsed by, or sponsored by Pollen R
 
 Pre-hardware. Every transport speaks upstream's published wire protocol
 (`duck-ipc-proto`, see `src/transport/protocol.ts`); the sim path is
-validated end to end, the `unix`/`ssh` paths against a fake daemon only —
+validated end to end, the `unix`/`ssh` paths against a fake daemon and a fake
+mediad console only —
 first contact with a real duck is ~Dec 2026.
 
 Licensed under Apache-2.0 (see LICENSE); upstream robot software is Apache 2.0 too.
