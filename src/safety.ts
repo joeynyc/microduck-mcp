@@ -76,39 +76,103 @@ export function clampVelocity(vx: number, vy: number, vyaw: number): Twist {
 export const WALK_RESEND_MS = 200;
 
 /**
+ * How often an in-flight walk() samples state for a pick-up. robotd pauses
+ * the policy within ~100 ms of being lifted and holds the pause at least
+ * 300 ms before it can hand back, so a 100 ms sample cannot miss the window.
+ */
+export const HELD_WATCH_MS = 100;
+
+/**
  * Drive a velocity intent for `durationS`, transport-independently: robotd's
  * `robot.move` is a deadman-stamped intent, so a walk of any length is a
  * stream of intents followed by a stop. Re-sends every `intervalMs`, then
  * sends robot.stop. Returns early if stopWalk() is called (duck_stop) or the
  * transport refuses an intent (fallen, unreachable).
+ *
+ * Alongside the stream it samples state every `watchMs`: robotd keeps the
+ * intent while someone holds the duck and resumes it on set-down, so a
+ * pick-up ends the walk (with a robot.stop) rather than letting it carry on
+ * out of their hands. The watcher runs beside the resend grid, never on it,
+ * so a slow sample cannot stretch the period the deadman sees.
  */
 export async function walk(
   t: DuckTransport,
   v: Twist,
   durationS: number,
   intervalMs = WALK_RESEND_MS,
-): Promise<{ applied: Twist; result: unknown; duration_s: number; interrupted: boolean }> {
+  watchMs = HELD_WATCH_MS,
+): Promise<{
+  applied: Twist;
+  result: unknown;
+  duration_s: number;
+  interrupted: boolean;
+  stopped_because?: "picked_up";
+}> {
   const epoch = ++walkEpoch;
   const started = Date.now();
-  const result = await t.call(M.robotMove, v);
-  const until = started + durationS * 1000;
-  let interrupted = false;
-  for (let next = started + intervalMs; next < until; next += intervalMs) {
-    const wait = next - Date.now();
-    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-    if (walkEpoch !== epoch) {
-      interrupted = true;
-      break;
+  // Resolved when the watcher sees a pick-up or the walk ends; every sleep
+  // below races it, so a pick-up is acted on now, not at the next grid tick.
+  let wake!: () => void;
+  const woken = new Promise<void>((r) => (wake = r));
+  const sleep = (ms: number) => {
+    if (ms <= 0) return Promise.resolve();
+    let timer: NodeJS.Timeout | undefined;
+    return Promise.race([new Promise<void>((r) => (timer = setTimeout(r, ms))), woken]).finally(() =>
+      clearTimeout(timer),
+    );
+  };
+  let walking = true;
+  let held = false;
+  // Never awaited: it cannot throw, and a slow sample (ssh, a stalled robotd)
+  // must not hold up the robot.stop below. It exits at its next check.
+  void (async () => {
+    while (walking) {
+      try {
+        if ((await t.state())?.safety?.picked_up === true) {
+          held = true;
+          wake();
+          return;
+        }
+      } catch {
+        // A failed sample is not a reason to stop; a failed intent is, and
+        // the stream below raises that itself.
+      }
+      await sleep(watchMs);
     }
-    await t.call(M.robotMove, v);
+  })();
+
+  let interrupted = false;
+  let result: unknown;
+  try {
+    result = await t.call(M.robotMove, v);
+    const until = started + durationS * 1000;
+    for (let next = started + intervalMs; next < until && !held; next += intervalMs) {
+      await sleep(next - Date.now());
+      if (walkEpoch !== epoch) {
+        interrupted = true;
+        break;
+      }
+      if (held) break;
+      await t.call(M.robotMove, v);
+    }
+    if (!interrupted && !held) {
+      await sleep(until - Date.now());
+      if (walkEpoch !== epoch) interrupted = true;
+    }
+  } finally {
+    walking = false;
+    wake();
   }
-  if (!interrupted) {
-    const wait = until - Date.now();
-    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-    if (walkEpoch !== epoch) interrupted = true;
-  }
+  // After the last intent has been answered, so the stop cannot overtake it
+  // on a transport that opens a connection per call.
   if (!interrupted) await t.call(M.robotStop);
-  return { applied: v, result, duration_s: durationS, interrupted };
+  return {
+    applied: v,
+    result,
+    duration_s: durationS,
+    interrupted,
+    ...(held ? { stopped_because: "picked_up" as const } : {}),
+  };
 }
 
 /** End any in-flight walk() loop. duck_stop calls this before robot.stop. */

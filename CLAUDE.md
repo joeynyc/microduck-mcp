@@ -186,7 +186,10 @@ note saying so.
   gated. It refuses while `safety.picked_up` (someone is holding the duck):
   robotd pauses the policy but keeps the intent and resumes ~0.2 s after
   set-down, so a walk would carry on out of their hands. Recovery (getup)
-  is exempt. Known gap: an in-flight `walk()` does not watch for a pick-up. Behaviors are gated by the `BEHAVIOR_GATES` table in `safety.ts`
+  is exempt. An in-flight `walk()` samples state every 100 ms beside the
+  resend grid (`HELD_WATCH_MS`; robotd holds a pause ≥300 ms) and ends with
+  `robot.stop` on a pick-up — sent after the last intent is answered, never
+  waiting on a slow sample. Behaviors are gated by the `BEHAVIOR_GATES` table in `safety.ts`
   (quack: none; getup: recovery = allowUnhealthy, battery + rate limit still
   apply); the tool enum derives from that table — add behaviors there.
 - `duck_walk` is transport-independent: `walk()` in `safety.ts` re-sends

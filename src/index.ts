@@ -290,7 +290,9 @@ tool(
       "2 s, max 10 s) then stops; the call returns when the walk is over. " +
       "duck_stop interrupts it at any time, and robotd's own deadman stops " +
       "the duck if this server dies mid-walk — it does not run away. Call " +
-      "duck_monitor afterwards to see how far it got. Refused below " +
+      "duck_monitor afterwards to see how far it got. If someone picks the " +
+      "duck up mid-walk the walk ends there (stopped_because: picked_up) " +
+      "rather than resuming when it is set down. Refused below " +
       `${LIMITS.minBatteryForMotion * 100}% battery, when fallen, or while ` +
       "someone is holding the duck.",
     inputSchema: {

@@ -260,6 +260,72 @@ describe("walk", () => {
     assert.equal(r.interrupted, false);
   });
 
+  /** A transport whose frame reports picked_up once `heldAfterMs` has passed. */
+  function liftedAfter(heldAfterMs: number, moveMs = 0) {
+    const events: string[] = [];
+    const t0 = Date.now();
+    const t: DuckTransport = {
+      async state() {
+        const held = Date.now() - t0 >= heldAfterMs;
+        return { policy: held ? "held" : "walk", safety: { fallen: false, limp: false, picked_up: held } } as any;
+      },
+      async call(method: string) {
+        if (method === "robot.move") {
+          events.push("move>");
+          await new Promise((r) => setTimeout(r, moveMs));
+          events.push("<move");
+        } else events.push(method);
+        return {};
+      },
+      async ping() {
+        return true;
+      },
+      async close() {},
+    };
+    return { t, events };
+  }
+
+  test("a pick-up mid-walk ends it with a robot.stop", async () => {
+    const { t, events } = liftedAfter(80);
+    const began = Date.now();
+    const r = await walk(t, { vx: 0.1, vy: 0, vyaw: 0 }, 5, 20, 10);
+    assert.equal(r.stopped_because, "picked_up");
+    assert.equal(r.interrupted, false);
+    assert.equal(events.at(-1), "robot.stop");
+    assert.ok(Date.now() - began < 500, "ended at the pick-up, not after the 5 s walk");
+  });
+
+  test("the stop never overtakes an intent still in flight", async () => {
+    // Each intent takes 30 ms; the pick-up lands while one is out.
+    const { t, events } = liftedAfter(45, 30);
+    await walk(t, { vx: 0.1, vy: 0, vyaw: 0 }, 5, 20, 5);
+    assert.deepEqual(events.slice(-2), ["<move", "robot.stop"]);
+  });
+
+  test("a sample that never answers does not hold up the stop", async () => {
+    const t = stub(OK);
+    const hung: DuckTransport = { ...t, state: () => new Promise(() => {}) };
+    const began = Date.now();
+    const r = await walk(hung, { vx: 0.1, vy: 0, vyaw: 0 }, 0.1, 20, 10);
+    assert.equal(t.calls.at(-1), "robot.stop");
+    assert.equal(r.stopped_because, undefined);
+    assert.ok(Date.now() - began < 300, `walk took ${Date.now() - began} ms`);
+  });
+
+  test("a failed sample does not end the walk", async () => {
+    const t = stub(OK);
+    const flaky: DuckTransport = {
+      ...t,
+      async state() {
+        throw new Error("subscribe timed out");
+      },
+    };
+    const r = await walk(flaky, { vx: 0.1, vy: 0, vyaw: 0 }, 0.15, 30, 10);
+    assert.equal(r.interrupted, false);
+    assert.equal(r.stopped_because, undefined);
+    assert.equal(t.calls.at(-1), "robot.stop");
+  });
+
   test("a refused intent aborts the walk", async () => {
     const t: DuckTransport = {
       async call() {
