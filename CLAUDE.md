@@ -67,7 +67,10 @@ sessions on this repo.
 Upstream publishes the contract in `duck-ipc-proto/src/lib.rs`. Motion,
 health and state were verified at commit 590b986 (API_VERSION 16) and
 re-checked unchanged at 2703e09 (daemon 0.13.0, API_VERSION 28); the policy
-channel is written against 2703e09. The sim vendors 590b986 because the
+channel is written against 2703e09. **Re-audited at d7560ef (daemon 0.17.4,
+API_VERSION 44, 2026-10-16):** every method and every `deny_unknown_fields`
+params struct we send is unchanged; the changes were additive and two were
+adopted (`robot.policies.sitting`, `safety.picked_up` — see below). The sim vendors 590b986 because the
 `.onnx` files left the repo for the Hub after it. **`src/transport/protocol.ts` is the only place method names and
 enum spellings live**; every transport, the sidecar and the tools use it.
 The shapes that needed adapting, and where the adapter is:
@@ -75,7 +78,7 @@ The shapes that needed adapting, and where the adapter is:
 | agent-facing                | on the wire                                              | adapter |
 |-----------------------------|----------------------------------------------------------|---------|
 | `duck_walk {vx,vy,wz}`      | `robot.move {vx,vy,vyaw}` re-sent every 200 ms on a fixed grid (deadman is 500 ms), then `robot.stop` | `walk()` in safety.ts (intents are deadman-stamped; a walk is a stream) |
-| `duck_behavior sit/stand`   | `robot.do {skill:"sit_toggle"}`                          | tool checks `state().policy === "sit"` first, so sit-while-seated is a no-op |
+| `duck_behavior sit/stand`   | `robot.do {skill:"sit_toggle"}`                          | `isSeated()` in safety.ts asks `robot.policies.sitting` first (v44; falls back to the frame's `policy === "sit"` on older daemons and the sim), so sit-while-seated is a no-op |
 | `duck_behavior getup`       | `robot.init` (power joints, ramp to home)                | gate "recovery"; on hardware a human rights the duck first |
 | `duck_behavior pickup/kick/roulade` | `robot.do {skill: ground_pick / kick_right / roulade}` | `BEHAVIORS` table in safety.ts |
 | `duck_behavior quack`       | `robot.sound {tag:"chirp"}`                              | (what `robotctl quack` plays) |
@@ -94,7 +97,10 @@ Intents sent as *requests* (with an id) are answered with `IntentResult`
 yet: `robot.head`, `robot.look`, `robot.pose`, `robot.mouth`, `robot.enable`,
 `robot.relax`, `robot.shutdown`, `robot.setMode`, `robot.skills` /
 `robot.setSkill` (skills are config since v22; `robot.policies.skills` lists
-them).
+them). New by v44 and also not exposed: `robot.rest` (sit, ease down, torque
+off — shutdown without the power-off), `robot.flashlight {on,toggle,color}`,
+the vetbook (`robot.vetbook*`, `vetbook.share` publishes to the Hub), and
+`robot.health` extras (`cpu_throttle`, servo-bus `missing` ids).
 
 **Camera on hardware** (`src/transport/media.ts`): `duck_camera` fetches
 `GET /frame` from mediad's console (`:8080`, always served) — mediad's own
@@ -177,7 +183,10 @@ note saying so.
 
 - TypeScript strict, ESM, Node16 module resolution. `npm run build` must pass.
 - Every motion tool goes through `preMotionCheck`. `duck_stop` is never
-  gated. Behaviors are gated by the `BEHAVIOR_GATES` table in `safety.ts`
+  gated. It refuses while `safety.picked_up` (someone is holding the duck):
+  robotd pauses the policy but keeps the intent and resumes ~0.2 s after
+  set-down, so a walk would carry on out of their hands. Recovery (getup)
+  is exempt. Known gap: an in-flight `walk()` does not watch for a pick-up. Behaviors are gated by the `BEHAVIOR_GATES` table in `safety.ts`
   (quack: none; getup: recovery = allowUnhealthy, battery + rate limit still
   apply); the tool enum derives from that table — add behaviors there.
 - `duck_walk` is transport-independent: `walk()` in `safety.ts` re-sends

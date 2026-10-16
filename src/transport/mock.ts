@@ -194,7 +194,15 @@ export class MockTransport implements DuckTransport {
       if (override === POLICY_NONE) return { slot, overridden: true };
       return { slot, path: override, origin: originOfPath(override), overridden: true };
     });
-    return { mode: "walk", enabled: true, slots, skills: BUILT_IN_SKILLS, mock: true };
+    return {
+      mode: "walk",
+      enabled: true,
+      slots,
+      skills: BUILT_IN_SKILLS,
+      homed: true,
+      sitting: this.mode === "sitting",
+      mock: true,
+    };
   }
 
   async state(): Promise<RobotState> {
@@ -228,7 +236,12 @@ export class MockTransport implements DuckTransport {
         y_m: +this.odom.y.toFixed(3),
         yaw_rad: +this.odom.yaw.toFixed(3),
       },
-      safety: { fallen: this.mode === "fallen", limp: this.mode === "fallen", busy: false },
+      safety: {
+        fallen: this.mode === "fallen",
+        limp: this.mode === "fallen",
+        picked_up: false,
+        busy: false,
+      },
       loop: { hz: 50, missed: 0 },
       mock: true,
     };

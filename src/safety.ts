@@ -1,4 +1,4 @@
-import { HealthResult, M, Skill, SoundTag } from "./transport/protocol.js";
+import { HealthResult, M, PoliciesResult, Skill, SoundTag } from "./transport/protocol.js";
 import { DuckTransport } from "./transport/types.js";
 
 /**
@@ -148,5 +148,31 @@ export async function preMotionCheck(
         `Run duck_health for details before commanding motion.`,
     );
   }
+  // robotd pauses the policy while the duck is in someone's hand but keeps
+  // the intent, and resumes ~0.2 s after it is set down — so a walk started
+  // now would carry on out of their hands. Recovery is exempt: on hardware a
+  // human is holding the duck to right it.
+  if (!opts.allowUnhealthy && (await t.state())?.safety?.picked_up === true) {
+    throw new Error(
+      `Someone is holding the duck (robotd's pick-up detector has paused the policy). ` +
+        `Wait until it is set down before commanding motion.`,
+    );
+  }
   lastMotionAt = now;
+}
+
+/**
+ * Whether the duck is in its seat, which decides what `sit_toggle` does.
+ * Upstream publishes this as `robot.policies.sitting`; a daemon too old to
+ * say (or the sim, which has no policy channel) falls back to the frame's
+ * label, which reads "sit" while seated.
+ */
+export async function isSeated(t: DuckTransport): Promise<boolean> {
+  try {
+    const p = (await t.call(M.robotPolicies)) as PoliciesResult | null;
+    if (typeof p?.sitting === "boolean") return p.sitting;
+  } catch {
+    // Older daemon: METHOD_NOT_FOUND. The frame still answers.
+  }
+  return (await t.state()).policy === "sit";
 }

@@ -1,6 +1,7 @@
 /**
  * Upstream's wire vocabulary, as published in
- * `pollen-robotics/microduck` `duck-ipc-proto/src/lib.rs` (commit 590b986).
+ * `pollen-robotics/microduck` `duck-ipc-proto/src/lib.rs` (commit 590b986;
+ * everything here re-checked at d7560ef, daemon 0.17.4 = API_VERSION 44).
  * This is the only place method names and enum spellings live; every
  * transport, the sidecar and the tools speak exactly these.
  */
@@ -105,6 +106,17 @@ export interface PoliciesResult {
   skills?: string[];
   /** Why the last reload / whole-robot reset failed; cleared by the next success. */
   change_error?: string | null;
+  /**
+   * Whether the robot has finished homing after a reload. A `robot.do` sent
+   * while it has not is refused. Absent from a daemon too old to say.
+   */
+  homed?: boolean | null;
+  /**
+   * Whether the duck is parked in its seat. Upstream's answer to "which way
+   * does sit_toggle go": seated → `robot.do sit_toggle` stands it up. Absent
+   * from a daemon too old to say; then the `robot.state` label is the fallback.
+   */
+  sitting?: boolean | null;
   [k: string]: unknown;
 }
 
@@ -129,6 +141,10 @@ export interface PolicySearchHit {
   origin: string;
   likes?: number | null;
   downloads?: number | null;
+  /** The publisher's one-line description, from the repo's manifest. */
+  description?: string | null;
+  /** A link to the repo's preview clip, when it carries one. */
+  preview?: string | null;
   [k: string]: unknown;
 }
 
@@ -164,8 +180,17 @@ export interface HealthResult {
 export interface RobotState {
   t: number;
   move: { requested: number[]; applied: number[]; limited_by?: string[] };
-  policy: string; // which net drove this tick: walk | stand | sit | rise | ...
-  safety: { fallen: boolean; limp: boolean; [k: string]: unknown };
+  /** What drove this tick: walk | stand | sit | rise | ground_pick | ... a
+   *  net, or held | homing | rest when no policy is driving. */
+  policy: string;
+  safety: {
+    fallen: boolean;
+    limp: boolean;
+    /** Somebody is holding the duck; the policy is paused until it is set
+     *  down, then resumes on its own. Absent from an older robotd = false. */
+    picked_up?: boolean;
+    [k: string]: unknown;
+  };
   loop: { hz: number; missed: number };
   [k: string]: unknown;
 }

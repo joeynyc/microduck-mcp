@@ -24,6 +24,7 @@ import {
   BEHAVIORS,
   BEHAVIOR_NAMES,
   clampVelocity,
+  isSeated,
   LIMITS,
   preBehaviorCheck,
   preMotionCheck,
@@ -290,7 +291,8 @@ tool(
       "duck_stop interrupts it at any time, and robotd's own deadman stops " +
       "the duck if this server dies mid-walk — it does not run away. Call " +
       "duck_monitor afterwards to see how far it got. Refused below " +
-      `${LIMITS.minBatteryForMotion * 100}% battery or when fallen.`,
+      `${LIMITS.minBatteryForMotion * 100}% battery, when fallen, or while ` +
+      "someone is holding the duck.",
     inputSchema: {
       vx: z.number().describe("Forward velocity, m/s. Negative = backward."),
       vy: z.number().default(0).describe("Sideways velocity, m/s."),
@@ -319,19 +321,20 @@ tool(
       "the duck first; in sim it is set upright in place), pickup (beak to " +
       "floor, grab), kick, roulade (forward roll), quack. sit/stand are " +
       "no-ops if already in that posture. Scripted moves take 0.5–3 s; call " +
-      "duck_monitor to see when 'busy' clears. Battery- and health-gated " +
-      "like walking (quack is free).",
+      "duck_monitor to see when 'busy' clears. Gated like walking: refused " +
+      "on low battery, when unhealthy, or while someone is holding the duck " +
+      "(getup is allowed while fallen or held; quack is never gated).",
     inputSchema: {
       name: z.enum(BEHAVIOR_NAMES).describe("Which behavior to run."),
     },
   },
   async ({ name }) => {
     // Upstream's sit↔stand is one toggle; the daemon knows which way. We
-    // check the frame so "sit" while seated doesn't stand the duck up — and
-    // we check before the gate, so a no-op costs neither a health round trip
-    // nor a rate-limit slot.
+    // ask whether it is seated so "sit" while seated doesn't stand the duck
+    // up — and we ask before the gate, so a no-op costs neither a health
+    // round trip nor a rate-limit slot.
     if (name === "sit" || name === "stand") {
-      const seated = (await duck.state()).policy === "sit";
+      const seated = await isSeated(duck);
       if (seated === (name === "sit")) {
         return json({ behavior: name, started: false, note: `already ${name === "sit" ? "sitting" : "standing"}` });
       }

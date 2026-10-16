@@ -4,6 +4,7 @@ import {
   BEHAVIOR_NAMES,
   BEHAVIORS,
   clampVelocity,
+  isSeated,
   LIMITS,
   preBehaviorCheck,
   preMotionCheck,
@@ -13,12 +14,12 @@ import {
 } from "../safety.js";
 import { DuckTransport } from "../transport/types.js";
 
-/** Transport stub: returns a fixed health payload, records every call. */
-function stub(health: unknown): DuckTransport & { calls: string[] } {
+/** Transport stub: returns a fixed health payload (and frame), records every call. */
+function stub(health: unknown, frame: unknown = { policy: "stand" }): DuckTransport & { calls: string[] } {
   return {
     calls: [],
     async state() {
-      return { policy: "stand" } as any;
+      return frame as any;
     },
     async call(method: string) {
       this.calls.push(method);
@@ -136,6 +137,65 @@ describe("preMotionCheck", () => {
       async close() {},
     };
     await assert.rejects(() => preMotionCheck(t), /ECONNREFUSED/);
+  });
+});
+
+describe("preMotionCheck: held", () => {
+  beforeEach(() => resetMotionCooldown());
+  const HELD = { policy: "held", safety: { fallen: false, limp: false, picked_up: true } };
+
+  test("refuses motion while someone is holding the duck", async () => {
+    await assert.rejects(preMotionCheck(stub(OK, HELD)), /holding the duck/);
+  });
+
+  test("a refusal for being held does not consume the cooldown", async () => {
+    await assert.rejects(preMotionCheck(stub(OK, HELD)));
+    await preMotionCheck(stub(OK));
+  });
+
+  test("recovery is allowed while held (a human rights the duck)", async () => {
+    await preMotionCheck(stub(OK, HELD), { allowUnhealthy: true });
+  });
+
+  test("a robotd too old to report picked_up reads as not held", async () => {
+    await preMotionCheck(stub(OK, { policy: "stand", safety: { fallen: false, limp: false } }));
+  });
+});
+
+describe("isSeated", () => {
+  /** A transport whose robot.policies answer (or throw) is `policies`, and whose frame is `policy`. */
+  function seatStub(policies: unknown, policy: string): DuckTransport {
+    return {
+      async state() {
+        return { policy } as any;
+      },
+      async call(method: string) {
+        if (method !== "robot.policies") return {};
+        if (policies instanceof Error) throw policies;
+        return policies;
+      },
+      async ping() {
+        return true;
+      },
+      async close() {},
+    };
+  }
+
+  test("trusts robot.policies.sitting over the frame label", async () => {
+    // Mid-rise or held, the label is not "sit" though the duck is still seated.
+    assert.equal(await isSeated(seatStub({ sitting: true }, "held")), true);
+    assert.equal(await isSeated(seatStub({ sitting: false }, "sit")), false);
+  });
+
+  test("falls back to the frame when the daemon does not say", async () => {
+    assert.equal(await isSeated(seatStub({ mode: "walk", slots: [] }, "sit")), true);
+    assert.equal(await isSeated(seatStub({ mode: "walk", slots: [] }, "stand")), false);
+  });
+
+  test("falls back to the frame on a daemon without the policy channel", async () => {
+    const tooOld = new Error("Method not found: robot.policies");
+    assert.equal(await isSeated(seatStub(tooOld, "sit")), true);
+    assert.equal(await isSeated(seatStub(tooOld, "walk")), false);
   });
 });
 
