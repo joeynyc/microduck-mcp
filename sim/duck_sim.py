@@ -38,7 +38,7 @@ import queue
 import sys
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from pathlib import Path
 
 import numpy as np
@@ -241,6 +241,7 @@ class DuckSim:
         self.mode = "standing"                # agent-facing summary, set alongside label
         self.missed = 0
         self.hz_est = 1.0 / CONTROL_DT
+        self.tick_times: deque[float] = deque()
 
     def _set_gain(self, ratio: float):
         if ratio == self.gain_ratio:
@@ -660,6 +661,10 @@ def main():
 
     t = time.time()
     sim = DuckSim(scene, policies, args.battery_v, args.deadman_s)
+    # Build the default duck_camera renderer now. Creating one is a GL setup
+    # of ~a quarter second on the loop thread; done on the first camera call,
+    # it would stall the policy mid-walk (12 missed ticks, measured).
+    sim.render("head", 320, 240)
     if args.record:
         w, h = (int(x) for x in args.record_size.lower().split("x"))
         sim.recorder = Recorder(args.record, args.record_fps, args.record_view, w, h, args.record_distance)
@@ -698,7 +703,6 @@ def main():
                 send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": f"{type(e).__name__}: {e}"}})
 
     next_tick = time.monotonic()
-    last_tick = next_tick
     while True:
         # Service requests between ticks, on the loop thread (rendering needs it).
         while True:
@@ -716,8 +720,15 @@ def main():
         if sim.recorder:
             sim.recorder.maybe_capture(sim)
         now = time.monotonic()
-        sim.hz_est += 0.05 * ((1.0 / max(now - last_tick, 1e-6)) - sim.hz_est)
-        last_tick = now
+        # The achieved rate over the last second of wall time, as robotd's
+        # loop.hz means it. Not 1/(this tick's interval): a loop that fell
+        # behind (a camera frame costs about half a tick) catches up with
+        # ticks back to back, each of which alone reads as ~500 Hz.
+        sim.tick_times.append(now)
+        while now - sim.tick_times[0] > 1.0:
+            sim.tick_times.popleft()
+        if now - sim.tick_times[0] >= 0.5:
+            sim.hz_est = (len(sim.tick_times) - 1) / (now - sim.tick_times[0])
         if args.no_realtime:
             sim.hz_est = 1.0 / CONTROL_DT
             continue
