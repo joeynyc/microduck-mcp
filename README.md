@@ -42,8 +42,10 @@ Then point your MCP client at it:
 }
 ```
 
-`"DUCK_TRANSPORT": "mock"` skips the setup entirely. For Claude Code:
-`claude mcp add microduck -e DUCK_TRANSPORT=sim -- npx -y microduck-mcp`.
+`"DUCK_TRANSPORT": "mock"` skips the setup entirely. That JSON works as-is in
+Claude Desktop and Cursor; **[docs/clients.md](docs/clients.md)** has
+copy-paste setup for Claude Desktop, Claude Code, Cursor, VS Code, Gemini CLI,
+Codex CLI and smolagents, plus why ChatGPT can't connect yet.
 
 On a real duck, use `"DUCK_TRANSPORT": "ssh"` with `"DUCK_HOST": "duck@microduck.local"`
 from a laptop, or `"unix"` when running on the robot itself.
@@ -59,7 +61,7 @@ DUCK_TRANSPORT=sim npm run demo  # same, in MuJoCo; frames land in demo-out/
 ```
 
 If Claude Desktop runs on Windows and the checkout lives in WSL, use
-`"command": "wsl.exe", "args": ["-e", "/abs/path/to/node", "/home/you/microduck-mcp/dist/cli.js"]`.
+`"command": "wsl.exe", "args": ["-e", "bash", "-lc", "DUCK_TRANSPORT=sim node /home/you/microduck-mcp/dist/cli.js"]`.
 
 ## Tools
 

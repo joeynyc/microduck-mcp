@@ -178,7 +178,16 @@ note saying so.
 - [x] Tests: unix contract tests against a fake robotd socket (incl.
       subscribe → first frame); ssh forwarding argv
 - [ ] Publish: npm + MCP registries/directories once validated on hardware
-- [ ] Integration guide per client (Claude Desktop config, Cursor, smolagents)
+- [x] Integration guide per client — `docs/clients.md`. Claude Code / Gemini
+      CLI / Codex configs were written by each CLI's own `mcp add`; smolagents
+      ran for real (needs `mcp<2`: mcpadapt 0.1.20 imports a name mcp 2.x
+      renamed; `structured_output=True` gives the agent dicts); the WSL
+      `wsl.exe -e bash -lc` route ran. Desktop/Cursor/VS Code from docs only.
+- [ ] ChatGPT: it only connects to remote HTTPS MCP servers, so it needs a
+      streamable-HTTP mode for this server + a tunnel. Codex CLI is the OpenAI
+      path until then.
+- [ ] Tool annotations (`readOnlyHint` etc.) so approval-prompting clients can
+      auto-approve the read-only tools and prompt only for motion
 
 ## Dev loop
 
