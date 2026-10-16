@@ -3,9 +3,9 @@
 Compose a recorded demo (scripts/record-demo.mjs output) into a 1280x720
 30 fps MP4: agent transcript on the left, the live duck on the right.
 
-    sim/.venv/bin/python scripts/compose-demo.py <rec-dir> [out.mp4]
+    node dist/cli.js sim-python scripts/compose-demo.py <rec-dir> [out.mp4]
 
-Needs Pillow (in sim/.venv) and ffmpeg on PATH.
+Needs Pillow (in the sim's venv, see `microduck-mcp setup-sim`) and ffmpeg on PATH.
 """
 from __future__ import annotations
 

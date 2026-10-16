@@ -1,5 +1,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SimTransport, SimTransportOptions } from "../transport/sim.js";
@@ -91,9 +93,25 @@ describe("SimTransport", () => {
       { readyTimeoutMs: 300 },
     ));
 
-  test("fails with a helpful message when the python interpreter is missing", async () => {
+  test("names the interpreter when the one it was given is missing", async () => {
     const t = new SimTransport({ python: "/nonexistent/python", script: fake });
-    await assert.rejects(() => t.call("robot.health"), /run sim\/setup.sh/);
+    await assert.rejects(() => t.call("robot.health"), /\/nonexistent\/python/);
     await t.close();
+  });
+
+  test("points at setup-sim when the sim has never been set up", async () => {
+    const saved = { home: process.env.DUCK_SIM_HOME, py: process.env.DUCK_SIM_PYTHON };
+    process.env.DUCK_SIM_HOME = mkdtempSync(join(tmpdir(), "sim-home-"));
+    delete process.env.DUCK_SIM_PYTHON;
+    try {
+      const t = new SimTransport({ script: fake });
+      await assert.rejects(() => t.call("robot.health"), /npx microduck-mcp setup-sim/);
+      await t.close();
+    } finally {
+      rmSync(process.env.DUCK_SIM_HOME, { recursive: true, force: true });
+      if (saved.home === undefined) delete process.env.DUCK_SIM_HOME;
+      else process.env.DUCK_SIM_HOME = saved.home;
+      if (saved.py !== undefined) process.env.DUCK_SIM_PYTHON = saved.py;
+    }
   });
 });

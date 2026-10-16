@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { M, POLICY_SLOTS, RobotState } from "./protocol.js";
+import { SETUP_HINT, sidecarAssets, simHome, venvPython } from "../sim-home.js";
 import {
   DuckTransport,
   JsonRpcRequest,
@@ -24,8 +25,11 @@ import {
  * whether it is talking to a simulation or to a robot — that is the contract.
  *
  * Env:
- *   DUCK_SIM_PYTHON   interpreter (default: <repo>/sim/.venv/bin/python)
- *   DUCK_SIM_SCRIPT   sidecar path (default: <repo>/sim/duck_sim.py)
+ *   DUCK_SIM_HOME     where `microduck-mcp setup-sim` put the venv and assets
+ *                     (default: the platform's per-user data dir, see sim-home.ts)
+ *   DUCK_SIM_PYTHON   interpreter (default: <sim home>/.venv)
+ *   DUCK_SIM_SCRIPT   sidecar path (default: <package>/sim/duck_sim.py)
+ *   DUCK_SIM_SCENE, DUCK_SIM_POLICIES  asset paths (default: <sim home>/assets)
  *   DUCK_SIM_ARGS     extra args, space-separated (e.g. "--no-realtime")
  *   DUCK_SIM_BATTERY_V, DUCK_SIM_DEADMAN_S, MUJOCO_GL — passed through.
  */
@@ -49,10 +53,27 @@ type Pending = {
 };
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+/**
+ * Defaults for the sidecar's environment; anything the caller set wins. The
+ * asset paths come from the manifest, so the sidecar never guesses. EGL is
+ * the headless renderer on Linux (incl. WSL2); elsewhere MuJoCo picks its own.
+ */
+function sidecarEnv(home: string): Record<string, string> {
+  const { scene, policies } = sidecarAssets(home);
+  return {
+    DUCK_SIM_SCENE: scene,
+    DUCK_SIM_POLICIES: policies,
+    ...(process.platform === "linux" ? { MUJOCO_GL: "egl" } : {}),
+  };
+}
 const SNAPSHOT_TIMEOUT_MS = 30_000;
 
 export class SimTransport implements DuckTransport {
   private readonly python: string;
+  /** Whether the interpreter was named by the caller, so a miss is theirs to fix, not setup's. */
+  private readonly explicitPython: boolean;
+  private readonly home: string;
   private readonly script: string;
   private readonly args: string[];
   private readonly readyTimeoutMs: number;
@@ -65,7 +86,10 @@ export class SimTransport implements DuckTransport {
   private exited?: Error;
 
   constructor(opts: SimTransportOptions = {}) {
-    this.python = opts.python ?? process.env.DUCK_SIM_PYTHON ?? join(repoRoot, "sim", ".venv", "bin", "python");
+    this.home = simHome();
+    const named = opts.python ?? process.env.DUCK_SIM_PYTHON;
+    this.explicitPython = named !== undefined;
+    this.python = named ?? venvPython(this.home);
     this.script = opts.script ?? process.env.DUCK_SIM_SCRIPT ?? join(repoRoot, "sim", "duck_sim.py");
     this.args = opts.args ?? (process.env.DUCK_SIM_ARGS?.split(/\s+/).filter(Boolean) ?? []);
     this.readyTimeoutMs = opts.readyTimeoutMs ?? 60_000;
@@ -81,11 +105,11 @@ export class SimTransport implements DuckTransport {
         return;
       }
       if (!existsSync(this.python)) {
-        reject(new Error(`sim python not found at ${this.python} — run sim/setup.sh (or set DUCK_SIM_PYTHON)`));
+        reject(new Error(this.explicitPython ? `sim python not found at ${this.python} (DUCK_SIM_PYTHON)` : SETUP_HINT));
         return;
       }
       const proc = spawn(this.python, [this.script, ...this.args], {
-        env: { MUJOCO_GL: "egl", ...process.env },
+        env: { ...sidecarEnv(this.home), ...process.env },
         stdio: ["pipe", "pipe", "pipe"],
       });
       this.proc = proc;

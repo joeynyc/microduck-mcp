@@ -5,7 +5,7 @@
  * Cursor, Gemini CLI, smolagents, ...). Transport is selected by env:
  *
  *   DUCK_TRANSPORT=mock            (default — no robot needed, canned state)
- *   DUCK_TRANSPORT=sim             (CPU MuJoCo + official ONNX policies; sim/setup.sh)
+ *   DUCK_TRANSPORT=sim             (CPU MuJoCo + official ONNX policies; `microduck-mcp setup-sim` once)
  *   DUCK_TRANSPORT=unix            (running on the robot)
  *   DUCK_TRANSPORT=ssh DUCK_HOST=duck@microduck.local
  */

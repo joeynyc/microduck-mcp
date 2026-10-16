@@ -655,7 +655,7 @@ def main():
     scene, policies = Path(args.scene), Path(args.policies)
     if not scene.exists() or not policies.exists():
         send({"jsonrpc": "2.0", "method": "sim.error", "params": {
-            "message": f"assets missing: scene={scene} policies={policies}. Run sim/setup.sh."}})
+            "message": f"assets missing: scene={scene} policies={policies}. Run `npx microduck-mcp setup-sim`."}})
         sys.exit(2)
 
     t = time.time()

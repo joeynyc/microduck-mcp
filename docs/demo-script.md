@@ -6,7 +6,7 @@ composited into a split-screen MP4 (transcript left, live duck right).
 Nothing is staged: the agent decides which tools to call.
 
 ```bash
-sim/setup.sh                 # once
+npm run setup-sim            # once
 npm run build
 npm run record-demo          # ~70 s take → demo-rec/{events.jsonl,frames/}
 npm run compose-demo         # → demo-rec/demo.mp4  (1280x720, 30 fps, H.264)

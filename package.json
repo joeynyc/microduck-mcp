@@ -1,7 +1,7 @@
 {
   "name": "microduck-mcp",
   "version": "0.1.0",
-  "description": "Agent-agnostic MCP server for the Pollen Robotics Microduck \u2014 by MicroduckHub",
+  "description": "Agent-agnostic MCP server for the Pollen Robotics Microduck — by MicroduckHub",
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -21,13 +21,13 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "microduck-mcp": "dist/index.js"
+    "microduck-mcp": "dist/cli.js"
   },
   "files": [
     "dist",
     "!dist/__tests__",
     "sim/duck_sim.py",
-    "sim/setup.sh",
+    "sim/assets.json",
     "README.md",
     "LICENSE"
   ],
@@ -39,13 +39,15 @@
   },
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "tsc && node dist/index.js",
+    "start": "node dist/cli.js",
+    "dev": "tsc && node dist/cli.js",
     "test": "tsc && node --test \"dist/**/*.test.js\"",
     "demo": "tsc && node scripts/demo.mjs",
     "record-demo": "node scripts/record-demo.mjs demo-rec",
-    "compose-demo": "sim/.venv/bin/python scripts/compose-demo.py demo-rec",
-    "prepublishOnly": "npm run build && node --test \"dist/**/*.test.js\""
+    "compose-demo": "node dist/cli.js sim-python scripts/compose-demo.py demo-rec",
+    "prepublishOnly": "npm run build && node --test \"dist/**/*.test.js\"",
+    "setup-sim": "tsc && node dist/cli.js setup-sim",
+    "gen-sim-assets": "node scripts/gen-sim-assets.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

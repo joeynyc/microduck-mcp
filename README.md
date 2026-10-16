@@ -15,49 +15,51 @@ duck before yours ships.
 
 ## Quick start
 
-```bash
-npm install
-npm run build
-
-# Mock duck (default — no hardware needed)
-npm start
-
-# Simulated duck: CPU MuJoCo + official ONNX policies (one-time setup ~1 min)
-sim/setup.sh            # needs uv (https://docs.astral.sh/uv/); vendors ~30 MB of assets
-DUCK_TRANSPORT=sim npm start
-
-# Real duck over ssh
-DUCK_TRANSPORT=ssh DUCK_HOST=duck@microduck.local npm start
-
-# On the robot itself
-DUCK_TRANSPORT=unix npm start
-```
-
-### Try it without a client
+No robot needed. The mock answers instantly; the sim is a physically simulated
+duck running Pollen's official policies.
 
 ```bash
-npm test                         # safety layer, mock, sim-transport contract tests
-npm run demo                     # health → walk → monitor → camera → quack → stop (mock)
-DUCK_TRANSPORT=sim npm run demo  # same, in MuJoCo; frames land in demo-out/
+npx -y microduck-mcp setup-sim   # once, ~1 min: MuJoCo + the official scene and policies (~35 MB)
 ```
 
-### Claude Desktop / Claude Code config
+It needs [uv](https://docs.astral.sh/uv/) (recommended — it fetches the right
+Python for you) or Python 3.10–3.13, installs into a per-user directory
+(`~/.local/share/microduck-mcp/sim` on Linux; `DUCK_SIM_HOME` to move it), and
+finishes by starting the sim and rendering a frame, so you know it works. Safe
+to re-run: it repairs anything missing or corrupt.
+
+Then point your MCP client at it:
 
 ```json
 {
   "mcpServers": {
     "microduck": {
-      "command": "node",
-      "args": ["/path/to/microduck-mcp/dist/index.js"],
-      "env": { "DUCK_TRANSPORT": "mock" }
+      "command": "npx",
+      "args": ["-y", "microduck-mcp"],
+      "env": { "DUCK_TRANSPORT": "sim" }
     }
   }
 }
 ```
 
-If Claude Desktop runs on Windows and this repo lives in WSL, use
-`"command": "wsl.exe", "args": ["-e", "/abs/path/to/node", "/home/you/microduck-mcp/dist/index.js"]`.
-Or for Claude Code: `claude mcp add microduck -e DUCK_TRANSPORT=mock -- node /path/to/dist/index.js`.
+`"DUCK_TRANSPORT": "mock"` skips the setup entirely. For Claude Code:
+`claude mcp add microduck -e DUCK_TRANSPORT=sim -- npx -y microduck-mcp`.
+
+On a real duck, use `"DUCK_TRANSPORT": "ssh"` with `"DUCK_HOST": "duck@microduck.local"`
+from a laptop, or `"unix"` when running on the robot itself.
+
+### From source
+
+```bash
+npm install
+npm run setup-sim                # same as above, from the checkout
+npm test                         # safety layer, mock, sim-transport and setup tests
+npm run demo                     # health → walk → monitor → camera → quack → stop (mock)
+DUCK_TRANSPORT=sim npm run demo  # same, in MuJoCo; frames land in demo-out/
+```
+
+If Claude Desktop runs on Windows and the checkout lives in WSL, use
+`"command": "wsl.exe", "args": ["-e", "/abs/path/to/node", "/home/you/microduck-mcp/dist/cli.js"]`.
 
 ## Tools
 
@@ -89,7 +91,7 @@ is always available.
 | `DUCK_TRANSPORT` | What | Needs |
 |---|---|---|
 | `mock` (default) | Canned state, instant | nothing |
-| `sim` | Headless CPU MuJoCo running the official `alpha_*.onnx` policies with robotd's control chain, in a Python sidecar (`sim/duck_sim.py`) | `sim/setup.sh` |
+| `sim` | Headless CPU MuJoCo running the official `alpha_*.onnx` policies with robotd's control chain, in a Python sidecar (`sim/duck_sim.py`) | `microduck-mcp setup-sim` once |
 | `unix` | The robot's own daemons over `/run/*.sock`, camera from mediad's console on `:8080` | running on the duck |
 | `ssh` | The same sockets and the console forwarded over `ssh -L`, then `unix` | a duck on the network, ssh access |
 
