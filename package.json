@@ -1,6 +1,7 @@
 {
   "name": "microduck-mcp",
   "version": "0.1.0",
+  "mcpName": "io.github.joeynyc/microduck-mcp",
   "description": "Agent-agnostic MCP server for the Pollen Robotics Microduck — by MicroduckHub",
   "keywords": [
     "mcp",
@@ -45,7 +46,7 @@
     "demo": "tsc && node scripts/demo.mjs",
     "record-demo": "node scripts/record-demo.mjs demo-rec",
     "compose-demo": "node dist/cli.js sim-python scripts/compose-demo.py demo-rec",
-    "prepublishOnly": "npm run build && node --test \"dist/**/*.test.js\"",
+    "prepublishOnly": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && npm run build && node --test \"dist/**/*.test.js\"",
     "setup-sim": "tsc && node dist/cli.js setup-sim",
     "gen-sim-assets": "node scripts/gen-sim-assets.mjs"
   },

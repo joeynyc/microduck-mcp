@@ -1,0 +1,42 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.joeynyc/microduck-mcp",
+  "title": "Microduck",
+  "description": "Drive a Pollen Robotics Microduck (or its MuJoCo sim): walk, sit, kick, camera, health, stop.",
+  "repository": {
+    "url": "https://github.com/joeynyc/microduck-mcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://microduckhub.com",
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "microduck-mcp",
+      "version": "0.1.0",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        {
+          "name": "DUCK_TRANSPORT",
+          "description": "Which duck: mock (canned, no setup), sim (run `npx -y microduck-mcp setup-sim` once), ssh (a duck on the network) or unix (on the robot)",
+          "format": "string",
+          "default": "mock",
+          "choices": ["mock", "sim", "ssh", "unix"],
+          "isRequired": false
+        },
+        {
+          "name": "DUCK_HOST",
+          "description": "ssh target for DUCK_TRANSPORT=ssh, e.g. duck@microduck.local",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "DUCK_SIM_HOME",
+          "description": "Where setup-sim installed the simulator, if not the per-user default",
+          "format": "string",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}
