@@ -8,6 +8,12 @@ make it pick things up, read its health, and stop it.
 
 Part of [MicroduckHub](https://microduckhub.com).
 
+![Claude Code driving a simulated Microduck through microduck-mcp: health check, a walk, the head camera, a refused 2 m/s sprint, a failed forward roll and the recovery](https://raw.githubusercontent.com/joeynyc/microduck-mcp/main/docs/demo.gif)
+
+*Unscripted: a real Claude Code session choosing its own tool calls against
+the simulator. The duck plays at real speed; the model's thinking time
+between calls is sped up 6× and labelled.*
+
 Works today with **no robot**: a mock transport for instant canned state, and
 a **simulator** — CPU MuJoCo running Pollen's official pretrained ONNX
 policies — so agents can walk, sit, kick and *look at* a physically simulated

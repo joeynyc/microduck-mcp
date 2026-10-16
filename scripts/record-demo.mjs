@@ -21,10 +21,9 @@ const shots = process.argv[3]
   ? JSON.parse(readFileSync(process.argv[3], "utf8"))
   : [
       "Check the duck's health and tell me if it's safe to move.",
-      "Walk forward for 8 seconds, then show me what the duck sees through its head camera.",
+      "Walk forward for 6 seconds, then show me what the duck sees through its head camera.",
       "Now sprint forward at 2 m/s for 3 seconds.",
-      "Sit down, then quack.",
-      "Stand up, then do a forward roll and check whether it landed on its feet.",
+      "Do a forward roll and check whether it landed on its feet; if it didn't, get it back up.",
       "Stop the duck and give me a one-line summary of what it did.",
     ];
 const pauseMs = Number(process.env.DEMO_PAUSE_MS ?? 2500);
@@ -37,7 +36,7 @@ writeFileSync(
     mcpServers: {
       microduck: {
         command: process.execPath,
-        args: [join(root, "dist", "index.js")],
+        args: [join(root, "dist", "cli.js")],
         env: {
           DUCK_TRANSPORT: "sim",
           DUCK_SIM_RECORD: join(out, "frames"),
@@ -74,7 +73,9 @@ const claude = spawn(
       "You are operating a small biped robot (a Pollen Robotics Microduck) through MCP tools. " +
       "Narrate briefly before each action in one short sentence, then act. Keep replies to two sentences.",
   ],
-  { cwd: root, stdio: ["pipe", "pipe", "pipe"] },
+  // Tool search off: with the tools deferred, every turn opens with a narrated
+  // "loading the walk tool" step that is plumbing, not the duck.
+  { cwd: root, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, ENABLE_TOOL_SEARCH: "false" } },
 );
 createInterface({ input: claude.stderr }).on("line", (l) => console.error(`[claude] ${l}`));
 

@@ -142,6 +142,11 @@ note saying so.
 - Speaks robotd's wire protocol over stdio, so `SimTransport` is
   `UnixTransport` with a child process where the socket is. Extra methods:
   `sim.camera {view,width,height}` → base64 PNG, `sim.reset`.
+- `loop.hz` is the achieved rate over the last second of wall time (what
+  robotd's means), not 1/(last tick interval): catch-up ticks after a stall
+  run back to back and read as ~500 Hz each. The default `duck_camera`
+  renderer (320×240) is built at startup; built on the first call it stalled
+  the policy ~0.25 s mid-walk.
 - **Known sim fidelity limit:** the reference scene's position actuators
   under-track small commands. Verified against upstream's own
   `infer_policy.py` (identical numbers, bit-identical obs): vx 0.2 → ~0

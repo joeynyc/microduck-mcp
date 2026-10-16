@@ -12,6 +12,8 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -42,6 +44,14 @@ ACCENT = (250, 182, 1)  # duck yellow
 LEAD_IN_S = 1.0   # video starts this long before the first event
 TAIL_S = 2.5      # and runs this long after the last
 
+# Time compression, always labelled on screen. The duck plays at real speed
+# whenever a robot tool is in flight, and for SETTLE_S after a behavior is
+# started (a scripted move answers "started" and then runs for up to ~3 s).
+# The rest — the model thinking between calls — plays at IDLE_SPEED. The
+# clock under the duck always shows real time. DEMO_IDLE_SPEED=1 disables it.
+IDLE_SPEED = float(os.environ.get("DEMO_IDLE_SPEED", "6"))
+SETTLE_S = 3.5
+
 
 def load(rec: Path):
     events = [json.loads(l) for l in (rec / "events.jsonl").read_text().splitlines() if l.strip()]
@@ -53,6 +63,9 @@ def load(rec: Path):
 
 def summarize_result(text: str) -> str:
     """One or two useful lines from a tool result, for the chat panel."""
+    # Claude Code saves image blocks to disk and adds a pointer line naming the
+    # local path; it is plumbing, and it would put a home directory on screen.
+    text = "\n".join(l for l in text.splitlines() if not re.match(r"^\[Image: source: .*\]$", l.strip()))
     try:
         d = json.loads(text)
     except Exception:
@@ -141,16 +154,49 @@ class Chat:
         return panel
 
 
+def realtime_windows(events) -> list[tuple[float, float]]:
+    """Spans of wall-clock time that play at 1x: robot tools in flight, plus a settle after behaviors."""
+    began, spans = {}, []
+    for e in events:
+        if e["type"] == "tool_use":
+            began[e["id"]] = (e["t"], e["name"])
+        elif e["type"] == "tool_result" and e["id"] in began:
+            t0, name = began.pop(e["id"])
+            spans.append((t0, e["t"] + (SETTLE_S if name == "duck_behavior" else 0.0)))
+    return spans
+
+
+def timeline(t_start: float, t_end: float, spans) -> list[tuple[float, bool]]:
+    """Real time of each output frame, and whether that frame is sped up."""
+    out, t = [], t_start
+    while t < t_end:
+        fast = IDLE_SPEED > 1 and not any(a <= t <= b for a, b in spans)
+        out.append((t, fast))
+        t += (IDLE_SPEED if fast else 1.0) / FPS
+    return out
+
+
+def make_gif(mp4: Path, gif: Path, width: int = 800, fps: int = 10) -> None:
+    """A README-sized GIF: GitHub and npm render GIFs inline, not MP4s from the repo."""
+    vf = f"fps={fps},scale={width}:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=128:stats_mode=diff[p];" \
+         f"[b][p]paletteuse=dither=bayer:bayer_scale=4:diff_mode=rectangle"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp4), "-vf", vf, "-loop", "0", str(gif)], check=True)
+    print(f"→ {gif} ({gif.stat().st_size / 1e6:.1f} MB)")
+
+
 def main():
-    rec = Path(sys.argv[1])
-    out = Path(sys.argv[2]) if len(sys.argv) > 2 else rec / "demo.mp4"
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    rec = Path(args[0])
+    out = Path(args[1]) if len(args) > 1 else rec / "demo.mp4"
     events, times, frames = load(rec)
     ev_times = [e["t"] for e in events if e["type"] != "end"]
     t_start = min(ev_times[0], times[0]) - LEAD_IN_S
     t_end = max(ev_times[-1], times[-1]) + TAIL_S
     chat = Chat(events, t_start)
-    n = int((t_end - t_start) * FPS)
-    print(f"{len(frames)} sim frames, {len(events)} events, {n} output frames ({n / FPS:.1f}s)")
+    plan = timeline(t_start, t_end, realtime_windows(events))
+    n = len(plan)
+    print(f"{len(frames)} sim frames, {len(events)} events, {t_end - t_start:.1f}s real → "
+          f"{n} output frames ({n / FPS:.1f}s, idle at {IDLE_SPEED:g}x)")
 
     ff = subprocess.Popen(
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}",
@@ -163,8 +209,7 @@ def main():
     last_frame_img = None
     waiting = Image.new("RGB", (sim_w, sim_h), PANEL)
     ImageDraw.Draw(waiting).text((sim_w // 2 - 90, sim_h // 2 - 10), "starting MuJoCo…", font=F_TEXT, fill=DIM)
-    for i in range(n):
-        t = t_start + i / FPS
+    for t, fast in plan:
         while fi + 1 < len(times) and times[fi + 1] <= t:
             fi += 1
         canvas = Image.new("RGB", (W, H), BG)
@@ -178,12 +223,19 @@ def main():
         d = ImageDraw.Draw(canvas)
         d.text((sim_x, 14), "MuJoCo  ·  Pollen's official ONNX policies  ·  50 Hz", font=F_TITLE, fill=ACCENT)
         d.text((sim_x, 42), "microduck_rl scene · robotd control chain ported in sim/duck_sim.py · live, 30 fps", font=F_SMALL, fill=DIM)
+        if fast:
+            label = f"{IDLE_SPEED:g}x  model thinking"
+            bw = d.textlength(label, font=F_BOLD) + 20
+            d.rectangle((sim_x + sim_w - bw - 10, sim_y + 10, sim_x + sim_w - 10, sim_y + 38), fill=ACCENT)
+            d.text((sim_x + sim_w - bw, sim_y + 15), label, font=F_BOLD, fill=BG)
         d.text((sim_x, sim_y + sim_h + 14), f"t = {t - t_start:5.1f} s", font=F_MONO, fill=DIM)
         d.text((sim_x + 140, sim_y + sim_h + 14), "github.com/joeynyc/microduck-mcp  ·  microduckhub.com", font=F_MONO, fill=DIM)
         ff.stdin.write(canvas.tobytes())
     ff.stdin.close()
     ff.wait()
     print(f"→ {out}")
+    if "--gif" in sys.argv:
+        make_gif(out, out.with_suffix(".gif"))
 
 
 if __name__ == "__main__":
