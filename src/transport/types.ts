@@ -63,6 +63,14 @@ export interface DuckTransport {
    */
   state(): Promise<RobotState>;
   /**
+   * Push robot.state frames to `onFrame` until the returned unsubscribe runs
+   * — the held-open form of robot.subscribe. Optional: transports without a
+   * streaming path leave it out and callers fall back to sampling state().
+   * Errors on the stream must NOT throw into `onFrame` (they end it silently;
+   * callers treat a quiet stream as "no subscription").
+   */
+  watchState?(onFrame: (frame: RobotState) => void): () => void;
+  /**
    * A still frame, if this transport can produce one. Not a robotd RPC — on
    * hardware it will come from mediad's WebRTC stream, in sim from the
    * renderer — so it is a capability on the transport, not a method name.

@@ -339,6 +339,43 @@ describe("walk", () => {
     assert.equal(t.calls.at(-1), "robot.stop");
   });
 
+  test("a pick-up is seen on a pushed frame even while polls never answer", async () => {
+    // A transport that can watchState: pushed frames, but its state() hangs —
+    // the subscription, not the poll backstop, must deliver detection.
+    const events: string[] = [];
+    const t: DuckTransport = {
+      watchState(onFrame) {
+        // Frames at ~real cadence; the duck is lifted at 80ms.
+        const timer = setInterval(() => {
+          onFrame({
+            t: 0,
+            move: { requested: [], applied: [] },
+            policy: "held",
+            safety: { fallen: false, limp: false, picked_up: true },
+            loop: { hz: 50, missed: 0 },
+          });
+        }, 10);
+        timer.unref();
+        return () => clearInterval(timer);
+      },
+      state: () => new Promise(() => {}), // poll path dead the whole walk
+      async call(method: string) {
+        if (method === "robot.move") events.push("move>");
+        else events.push(method);
+        return {};
+      },
+      async ping() {
+        return true;
+      },
+      async close() {},
+    };
+    const began = Date.now();
+    const r = await walk(t, { vx: 0.1, vy: 0, vyaw: 0 }, 5, 20, 10);
+    assert.equal(r.stopped_because, "picked_up");
+    assert.equal(events.at(-1), "robot.stop");
+    assert.ok(Date.now() - began < 1000, "held frame ended the walk fast");
+  });
+
   test("a refused intent aborts the walk", async () => {
     const t: DuckTransport = {
       async call() {

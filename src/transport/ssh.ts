@@ -110,6 +110,27 @@ export class SshTransport implements DuckTransport {
     return (await this.start()).state();
   }
 
+  /**
+   * The tunnel may not exist yet when a walk starts, so subscription is lazy:
+   * if the caller unsubscribes before start() resolves, the inner stream is
+   * never opened (or closed the moment it is).
+   */
+  watchState(onFrame: (frame: RobotState) => void): () => void {
+    let innerOff: (() => void) | undefined;
+    let cancelled = false;
+    this.start().then(
+      (t) => {
+        if (cancelled) return;
+        innerOff = t.watchState?.(onFrame);
+      },
+      () => {}, // no tunnel → the caller's poll watcher is the backstop
+    );
+    return () => {
+      cancelled = true;
+      innerOff?.();
+    };
+  }
+
   ping(): Promise<boolean> {
     return pingViaHealth(this);
   }
