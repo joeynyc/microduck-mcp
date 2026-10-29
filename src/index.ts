@@ -11,6 +11,7 @@
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { createRequire } from "node:module";
 import { z, ZodRawShape } from "zod";
 import { DuckTransport } from "./transport/types.js";
@@ -28,6 +29,7 @@ import {
   LIMITS,
   preBehaviorCheck,
   preMotionCheck,
+  stopMotion,
   stopWalk,
   walk,
 } from "./safety.js";
@@ -59,6 +61,14 @@ type ToolResult = { content: Content[]; isError?: boolean };
 
 const json = (v: unknown): ToolResult => ({ content: [{ type: "text", text: JSON.stringify(v, null, 2) }] });
 
+// Annotations let approval-prompting clients auto-approve the read-only tools
+// and prompt only for what changes the robot. They are hints, never the gate:
+// preMotionCheck is. Required in tool() so a new tool has to pick one.
+/** Reads the robot, changes nothing. */
+const READ_ONLY: ToolAnnotations = { readOnlyHint: true, openWorldHint: false };
+/** Moves a physical robot in the room: nothing to destroy, but not undoable either. */
+const MOTION: ToolAnnotations = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
+
 /**
  * Register a tool whose handler may throw: the error becomes an `isError`
  * result with an agent-readable message instead of a protocol failure. Every
@@ -66,7 +76,7 @@ const json = (v: unknown): ToolResult => ({ content: [{ type: "text", text: JSON
  */
 function tool<S extends ZodRawShape>(
   name: string,
-  meta: { title: string; description: string; inputSchema: S },
+  meta: { title: string; description: string; inputSchema: S; annotations: ToolAnnotations },
   handler: (args: z.infer<z.ZodObject<S>>) => Promise<ToolResult>,
 ): void {
   // The SDK's callback generic does not unify with a caller-supplied shape;
@@ -94,6 +104,7 @@ tool(
       "safe to call. Call this FIRST in any session, and again before any " +
       "sequence of motion commands.",
     inputSchema: {},
+    annotations: READ_ONLY,
   },
   async () => json(await duck.call(M.robotHealth)),
 );
@@ -104,6 +115,7 @@ tool(
     title: "Duck identity and uptime",
     description: "The robot's name, serial and uptime (configd system.info). Read-only.",
     inputSchema: {},
+    annotations: READ_ONLY,
   },
   async () => json(await duck.call(M.systemInfo)),
 );
@@ -117,6 +129,7 @@ tool(
       "(Installing/rolling back is deliberately NOT exposed as a tool yet — " +
       "see CLAUDE.md 'Deliberately excluded'.)",
     inputSchema: {},
+    annotations: READ_ONLY,
   },
   async () => json(await duck.call(M.updateListInstalled, { component: DAEMON_COMPONENT })),
 );
@@ -134,6 +147,7 @@ tool(
       "robot, or to check posture before/after a behavior. For battery and " +
       "temps use duck_health.",
     inputSchema: {},
+    annotations: READ_ONLY,
   },
   async () => json(await duck.state()),
 );
@@ -157,6 +171,7 @@ tool(
       width: z.number().int().min(64).max(640).default(320),
       height: z.number().int().min(48).max(480).default(240),
     },
+    annotations: READ_ONLY,
   },
   async (req) => {
     if (!duck.snapshot) throw new Error(`no camera on the ${transportName} transport`);
@@ -186,6 +201,7 @@ tool(
       "call — call it before and after duck_policy_load so you can see what " +
       "changed. Needs daemon 0.13 or newer.",
     inputSchema: {},
+    annotations: READ_ONLY,
   },
   async () => json(await listPolicies(duck)),
 );
@@ -202,6 +218,8 @@ tool(
     inputSchema: {
       query: z.string().min(1).describe("Free text, e.g. 'microduck walk'."),
     },
+    // Asks the Hugging Face Hub (through updaterd); downloads nothing.
+    annotations: { readOnlyHint: true, openWorldHint: true },
   },
   async ({ query }) => json({ models: await searchPolicies(duck, query) }),
 );
@@ -241,6 +259,8 @@ tool(
         .min(1)
         .describe("HF repo 'org/name[@rev]', an absolute path on the board, or 'none'."),
     },
+    // Overwrites the slot's config (survives a reboot); duck_policy_reset undoes it.
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   },
   async ({ slot, source }) => {
     // A load homes the robot and rebuilds every ONNX session under the
@@ -270,6 +290,7 @@ tool(
         .optional()
         .describe("Which slot to reset. Omit to reset all seven."),
     },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   async ({ slot }) => {
     await preMotionCheck(duck);
@@ -292,9 +313,10 @@ tool(
       "the duck if this server dies mid-walk — it does not run away. Call " +
       "duck_monitor afterwards to see how far it got. If someone picks the " +
       "duck up mid-walk the walk ends there (stopped_because: picked_up) " +
-      "rather than resuming when it is set down. Refused below " +
-      `${LIMITS.minBatteryForMotion * 100}% battery, when fallen, or while ` +
-      "someone is holding the duck.",
+      "rather than resuming when it is set down. A new duck_walk replaces one " +
+      "still in progress (the earlier call returns interrupted: true). " +
+      `Refused below ${LIMITS.minBatteryForMotion * 100}% battery, when ` +
+      "fallen, or while someone is holding the duck.",
     inputSchema: {
       vx: z.number().describe("Forward velocity, m/s. Negative = backward."),
       vy: z.number().default(0).describe("Sideways velocity, m/s."),
@@ -306,6 +328,7 @@ tool(
         .default(2)
         .describe("Seconds to keep walking before the intent expires."),
     },
+    annotations: MOTION,
   },
   async ({ vx, vy, wz, duration_s }) => {
     await preMotionCheck(duck);
@@ -329,6 +352,7 @@ tool(
     inputSchema: {
       name: z.enum(BEHAVIOR_NAMES).describe("Which behavior to run."),
     },
+    annotations: MOTION,
   },
   async ({ name }) => {
     // Upstream's sit↔stand is one toggle; the daemon knows which way. We
@@ -357,11 +381,9 @@ tool(
       "— always available. Call this if anything looks wrong, if a human " +
       "asks you to stop, or if you are unsure what the robot is doing.",
     inputSchema: {},
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
-  async () => {
-    stopWalk();
-    return json(await duck.call(M.robotStop));
-  },
+  async () => json(await stopMotion(duck)),
 );
 
 // ---------------------------------------------------------------------------
