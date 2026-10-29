@@ -1,4 +1,4 @@
-import { test, describe, beforeEach } from "node:test";
+import { test, describe, beforeEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import {
   BEHAVIOR_NAMES,
@@ -255,6 +255,25 @@ describe("walk", () => {
     assert.ok(t.calls.length < 10, "did not keep walking after stopWalk");
   });
 
+  test("a wall-clock step neither cuts the walk short nor bursts intents", async () => {
+    // NTP / WSL2 resyncs step Date.now(); the grid must not follow it. The
+    // clock steps 2 s forward right after the walk reads its start time.
+    const realNow = Date.now.bind(Date);
+    let reads = 0;
+    const step = mock.method(Date, "now", () => realNow() + (reads++ > 0 ? 2000 : 0));
+    try {
+      const t = stub(OK);
+      const began = performance.now();
+      await walk(t, { vx: 0.1, vy: 0, vyaw: 0 }, 0.3, 50);
+      const took = performance.now() - began;
+      const intents = t.calls.filter((c) => c === "robot.move").length;
+      assert.ok(took >= 280, `walk lasted ${took.toFixed(0)} ms of 300`);
+      assert.ok(intents >= 5 && intents <= 7, `expected ~6 intents, got ${intents}`);
+    } finally {
+      step.mock.restore();
+    }
+  });
+
   test("re-sends on a fixed grid, so a slow round trip does not stretch the period", async () => {
     // Each intent takes 40 ms to answer; with a 50 ms grid over 300 ms we
     // still expect ~6 sends. An additive loop (sleep, then await) would
@@ -337,6 +356,43 @@ describe("walk", () => {
     assert.equal(r.interrupted, false);
     assert.equal(r.stopped_because, undefined);
     assert.equal(t.calls.at(-1), "robot.stop");
+  });
+
+  test("a pick-up is seen on a pushed frame even while polls never answer", async () => {
+    // A transport that can watchState: pushed frames, but its state() hangs —
+    // the subscription, not the poll backstop, must deliver detection.
+    const events: string[] = [];
+    const t: DuckTransport = {
+      watchState(onFrame) {
+        // Frames at ~real cadence; the duck is lifted at 80ms.
+        const timer = setInterval(() => {
+          onFrame({
+            t: 0,
+            move: { requested: [], applied: [] },
+            policy: "held",
+            safety: { fallen: false, limp: false, picked_up: true },
+            loop: { hz: 50, missed: 0 },
+          });
+        }, 10);
+        timer.unref();
+        return () => clearInterval(timer);
+      },
+      state: () => new Promise(() => {}), // poll path dead the whole walk
+      async call(method: string) {
+        if (method === "robot.move") events.push("move>");
+        else events.push(method);
+        return {};
+      },
+      async ping() {
+        return true;
+      },
+      async close() {},
+    };
+    const began = Date.now();
+    const r = await walk(t, { vx: 0.1, vy: 0, vyaw: 0 }, 5, 20, 10);
+    assert.equal(r.stopped_because, "picked_up");
+    assert.equal(events.at(-1), "robot.stop");
+    assert.ok(Date.now() - began < 1000, "held frame ended the walk fast");
   });
 
   test("a refused intent aborts the walk", async () => {

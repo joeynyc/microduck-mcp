@@ -49,17 +49,34 @@ export async function preBehaviorCheck(t: DuckTransport, name: Behavior): Promis
 let lastMotionAt = 0;
 /** Bumped by stopWalk(); an in-flight walk() ends when it changes. */
 let walkEpoch = 0;
-/** The walk's robot.move that is on the wire right now, if any. */
-let inFlightIntent: Promise<unknown> | undefined;
+/**
+ * Every robot.move sent but not yet answered. walk() pipelines its intents —
+ * a slow round trip must not push the next send off its grid — so several can
+ * be on the wire at once, and a stop sent before they settle could be
+ * overtaken by one (the unix/ssh transports open a connection per call).
+ * stopWalk() hands the set to stopMotion; walk() drains it before its own
+ * robot.stop.
+ */
+const inFlightIntents = new Set<Promise<unknown>>();
 
 function sendIntent(t: DuckTransport, v: Twist): Promise<unknown> {
   const p = t.call(M.robotMove, v);
-  inFlightIntent = p;
+  inFlightIntents.add(p);
   const clear = () => {
-    if (inFlightIntent === p) inFlightIntent = undefined;
+    inFlightIntents.delete(p);
   };
   p.then(clear, clear);
   return p;
+}
+
+/**
+ * The second robot.stop: once every intent that was on the wire beside the
+ * first stop has been answered, none of them can still overtake it.
+ * robot.stop is idempotent, so the repeat costs nothing.
+ */
+async function restopAfter(t: DuckTransport, drain: Promise<unknown>): Promise<unknown> {
+  await drain.catch(() => {});
+  return t.call(M.robotStop);
 }
 
 /** Clear the motion cooldown. Intended for tests; never call from a tool. */
@@ -121,7 +138,11 @@ export async function walk(
   stopped_because?: "picked_up";
 }> {
   const epoch = ++walkEpoch;
-  const started = Date.now();
+  // The grid runs on the monotonic clock. On Date.now() a wall-clock step
+  // (NTP, WSL2 resyncing its clock, resume from sleep) ended a 10 s walk
+  // 1.2 s early in the walk-link bench, and a backward step would sleep past
+  // the deadman or burst catch-up intents.
+  const started = performance.now();
   // Resolved when the watcher sees a pick-up or the walk ends; every sleep
   // below races it, so a pick-up is acted on now, not at the next grid tick.
   let wake!: () => void;
@@ -135,55 +156,130 @@ export async function walk(
   };
   let walking = true;
   let held = false;
-  // Never awaited: it cannot throw, and a slow sample (ssh, a stalled robotd)
-  // must not hold up the robot.stop below. It exits at its next check.
+  const seeHeld = (frame: { safety?: { picked_up?: boolean } } | undefined) => {
+    if (frame?.safety?.picked_up === true) {
+      held = true;
+      wake();
+    }
+  };
+  // Detection prefers the daemon's own stream: robot.subscribe pushes
+  // robot.state at 50Hz, so a pick-up is seen one leg after it happens —
+  // no request round trip, no waiting for a poll's turn. lastFrameAt is the
+  // stream's heartbeat for the poll backstop below.
+  let lastFrameAt = -Infinity; // ms since started; -Infinity = no frames yet
+  const unsub = t.watchState?.((frame) => {
+    lastFrameAt = performance.now() - started;
+    seeHeld(frame);
+  });
   void (async () => {
-    while (walking) {
-      try {
-        if ((await t.state())?.safety?.picked_up === true) {
-          held = true;
-          wake();
-          return;
-        }
-      } catch {
-        // A failed sample is not a reason to stop; a failed intent is, and
-        // the stream below raises that itself.
-      }
-      await sleep(watchMs);
+    // Backstop for transports without watchState and for a stream that dies
+    // silently: poll only once no frame has arrived for half a second —
+    // while the subscription lives it costs nothing to leave this asleep.
+    // Cap pending samples at 3, same reason as before: a stalled robotd must
+    // not have a socket queued against it every interval. The first sample
+    // goes out immediately — a pick-up inside the first interval should not
+    // wait a grid tick.
+    let pending = 0;
+    const sample = () => {
+      if (pending >= 3) return;
+      pending++;
+      t.state().then(
+        (frame) => {
+          pending--;
+          seeHeld(frame);
+        },
+        () => {
+          // A failed sample is not a reason to stop; a failed intent is,
+          // and the stream below raises that itself.
+          pending--;
+        },
+      );
+    };
+    // One immediate poll regardless: it covers the window where the stream
+    // is still opening (or was refused) — later polls fire only while the
+    // stream stays quiet.
+    sample();
+    for (let next = started + watchMs; walking && !held; next += watchMs) {
+      if (!unsub || performance.now() - started - lastFrameAt > 500) sample();
+      await sleep(next - performance.now());
     }
   })();
 
   let interrupted = false;
   let result: unknown;
+  let first: Promise<unknown> | undefined;
+  /** The first intent rejection; ends the walk like the awaited version did. */
+  let failure: unknown;
+  const fail = (e: unknown) => {
+    if (failure === undefined) {
+      failure = e;
+      wake();
+    }
+  };
   try {
-    result = await sendIntent(t, v);
+    // Sends stay strictly on the grid: a send is NOT awaited here, because a
+    // round trip longer than the interval (wifi spikes) would serialise the
+    // stream on responses and stretch the gap robotd's deadman sees. The
+    // first rejection still ends the walk — via `failure`, not an await.
+    first = sendIntent(t, v);
+    first.catch(fail);
     const until = started + durationS * 1000;
     for (let next = started + intervalMs; next < until && !held; next += intervalMs) {
-      await sleep(next - Date.now());
+      await sleep(next - performance.now());
       if (walkEpoch !== epoch) {
         interrupted = true;
         break;
       }
-      if (held) break;
-      await sendIntent(t, v);
+      if (held || failure !== undefined) break;
+      sendIntent(t, v).catch(fail);
     }
-    if (!interrupted && !held) {
-      await sleep(until - Date.now());
+    if (!interrupted && !held && failure === undefined) {
+      await sleep(until - performance.now());
       if (walkEpoch !== epoch) interrupted = true;
     }
+    // A rejected intent ends the walk with that error (the awaited version
+    // threw it from sendIntent itself). The walk's result is the first
+    // intent's answer — awaited AFTER the stops below: a stop must never
+    // wait on an intent's round trip.
+    if (failure !== undefined) throw failure;
   } catch (e) {
     // A refused or timed-out intent ends the walk. robotd's deadman would
-    // zero it within 500 ms anyway; say it explicitly, best effort. Not after
-    // stopWalk(): duck_stop owns that stop.
-    if (walkEpoch === epoch) await t.call(M.robotStop).catch(() => {});
+    // zero it within 500 ms anyway; say it explicitly, best effort. Same
+    // shape as a normal end — one stop now, one after outstanding intents
+    // answer — so a late intent cannot overtake the only stop it saw. Not
+    // after stopWalk(): duck_stop owns that stop.
+    if (walkEpoch === epoch) {
+      // Best effort throughout: the walk is already failing with `e`.
+      const hadInFlight = inFlightIntents.size > 0;
+      const stop = t.call(M.robotStop).catch(() => {});
+      if (hadInFlight) await restopAfter(t, Promise.allSettled([...inFlightIntents])).catch(() => {});
+      await stop;
+    }
     throw e;
   } finally {
     walking = false;
+    unsub?.();
     wake();
   }
-  // After the last intent has been answered, so the stop cannot overtake it
-  // on a transport that opens a connection per call.
-  if (!interrupted) await t.call(M.robotStop);
+  // duck_stop's own pattern: the stop goes out now, and once every intent
+  // has been answered it goes out again — on a transport that opens a
+  // connection per call the first could still be overtaken by an intent on
+  // the wire. Nothing in flight → nothing can overtake it → no re-stop.
+  if (!interrupted) {
+    const hadInFlight = inFlightIntents.size > 0;
+    const stop = t.call(M.robotStop);
+    // Marked handled now so a rejection during the drain is not an
+    // unhandled rejection; `await stop` below still raises it.
+    stop.catch(() => {});
+    if (hadInFlight) await restopAfter(t, Promise.allSettled([...inFlightIntents]));
+    // The result is the first intent's answer — awaited only now, never
+    // before a stop. If it was refused late, that error is the walk's.
+    result = await first;
+    await stop;
+  } else {
+    // duck_stop sent the stops; still report what the first intent got.
+    result = await first?.catch(() => undefined);
+  }
   return {
     applied: v,
     result,
@@ -194,12 +290,13 @@ export async function walk(
 }
 
 /**
- * End any in-flight walk() loop. Returns the intent it still has on the
- * wire, if any (see stopMotion).
+ * End any in-flight walk() loop. Resolves once every robot.move that is
+ * still on the wire has been answered — several can be, now that walk()
+ * pipelines its sends (see stopMotion).
  */
 export function stopWalk(): Promise<unknown> | undefined {
   walkEpoch++;
-  return inFlightIntent;
+  return inFlightIntents.size ? Promise.allSettled([...inFlightIntents]) : undefined;
 }
 
 /**
@@ -211,12 +308,12 @@ export function stopWalk(): Promise<unknown> | undefined {
  */
 export async function stopMotion(t: DuckTransport): Promise<unknown> {
   const inFlight = stopWalk();
-  const result = await t.call(M.robotStop);
-  if (inFlight) {
-    await inFlight.catch(() => {});
-    await t.call(M.robotStop);
-  }
-  return result;
+  // Not awaited before the drain: the first stop goes out now, whatever
+  // happens to it, and the second is owed even if the first failed.
+  const stop = t.call(M.robotStop);
+  stop.catch(() => {}); // handled here; the caller still gets the rejection
+  if (inFlight) await restopAfter(t, inFlight);
+  return stop;
 }
 
 /**

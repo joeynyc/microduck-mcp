@@ -215,20 +215,27 @@ note saying so.
   gated. It refuses while `safety.picked_up` (someone is holding the duck):
   robotd pauses the policy but keeps the intent and resumes ~0.2 s after
   set-down, so a walk would carry on out of their hands. Recovery (getup)
-  is exempt. An in-flight `walk()` samples state every 100 ms beside the
-  resend grid (`HELD_WATCH_MS`; robotd holds a pause ≥300 ms) and ends with
-  `robot.stop` on a pick-up — sent after the last intent is answered, never
-  waiting on a slow sample. Behaviors are gated by the `BEHAVIOR_GATES` table in `safety.ts`
+  is exempt. An in-flight `walk()` watches for a pick-up on a held-open
+  `robot.subscribe` stream (`DuckTransport.watchState?`, unix and ssh) and
+  falls back to sampling `state()` every 100 ms (`HELD_WATCH_MS`; robotd
+  holds a pause ≥300 ms) when the transport has no stream or it goes quiet
+  for 0.5 s; a pick-up ends it with `robot.stop` at once, never waiting on
+  a slow sample. Behaviors are gated by the `BEHAVIOR_GATES` table in `safety.ts`
   (quack: none; getup: recovery = allowUnhealthy, battery + rate limit still
   apply); the tool enum derives from that table — add behaviors there.
-- `duck_walk` is transport-independent: `walk()` in `safety.ts` re-sends
-  `robot.move` every 200 ms (on a fixed grid, under the 500 ms deadman) for `duration_s` then sends `robot.stop`, because
-  upstream's intents are deadman-stamped. `duck_stop` calls `stopMotion()`:
-  it ends the loop and sends `robot.stop` at once, then again once a
-  `robot.move` still on the wire has been answered (per-call connections
-  don't order the two). A failed resend also ends with `robot.stop`. The
-  rate-limit slot is taken before the health round trip, so parallel motion
-  calls can't both pass.
+- `duck_walk` is transport-independent: `walk()` in `safety.ts` sends
+  `robot.move` every 200 ms on a fixed grid of the monotonic clock (under
+  the 500 ms deadman) for `duration_s`, because upstream's intents are
+  deadman-stamped. Sends are pipelined, not awaited: a slow round trip must
+  not push the next one off the grid. Every way a walk ends (duration,
+  pick-up, failed intent, `duck_stop` via `stopMotion()`) sends `robot.stop`
+  at once and again once every intent still on the wire has been answered
+  (per-call connections don't order them). The rate-limit slot is taken
+  before the health round trip, so parallel motion calls can't both pass.
+- `node bench/walk-link.mjs` (after `npx tsc`) — `walk()`/`stopMotion()`
+  over a seeded lossy link (5–40 ms, 10% spikes to 350 ms, reordering):
+  intent arrival gaps vs the deadman, stop and pick-up latency, and
+  ordering violations.
 - Never spell a wire method inline — import `M` from `transport/protocol.ts`.
   `DuckTransport.call(method, params)` routes to the daemon by the method's
   namespace (`serviceFor` in `types.ts`); there is no service argument.

@@ -64,6 +64,43 @@ export class UnixTransport implements DuckTransport {
   }
 
   /**
+   * Hold a robot.subscribe connection open and hand every robot.state
+   * notification to `onFrame`. The ack and any error are ignored on purpose:
+   * a dead stream just goes quiet, and the caller treats quiet as
+   * "no subscription" (its poll watcher is the backstop). Socket is unref'd
+   * for the same reason the exchange sockets can be short-lived — a stream
+   * must not pin a dying process.
+   */
+  watchState(onFrame: (frame: RobotState) => void): () => void {
+    const sock = net.createConnection(this.socketPaths.robotd);
+    sock.unref();
+    sock.on("connect", () => {
+      const id = this.nextId++;
+      sock.write(JSON.stringify({ jsonrpc: "2.0", id, method: M.robotSubscribe, params: { hz: 50 } }) + "\n");
+    });
+    let dead = false;
+    const kill = () => {
+      if (!dead) {
+        dead = true;
+        sock.destroy();
+      }
+    };
+    createInterface({ input: sock })
+      .on("line", (line) => {
+        try {
+          const msg = JSON.parse(line) as Inbound;
+          if ("method" in msg && msg.method === M.robotState) onFrame(msg.params as RobotState);
+        } catch {
+          /* a malformed line is not worth killing the stream */
+        }
+      })
+      .on("error", kill); // readline re-emits socket errors; kill the stream quietly
+    sock.on("error", kill);
+    sock.on("close", () => (dead = true));
+    return kill;
+  }
+
+  /**
    * Connect, send one request, read lines until `pick` returns a value (or
    * throws), then close. `pick` sees every inbound message on the connection.
    */

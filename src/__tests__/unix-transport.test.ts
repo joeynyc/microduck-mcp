@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { UnixTransport } from "../transport/unix.js";
 import { SshTransport } from "../transport/ssh.js";
 import { pngSize } from "../transport/media.js";
+import { RobotState } from "../transport/protocol.js";
 
 /**
  * Contract tests for UnixTransport against a fake robotd on a Unix socket:
@@ -153,6 +154,26 @@ describe("UnixTransport camera (mediad /frame)", () => {
   test("pngSize reads IHDR and rejects non-PNG bytes", () => {
     assert.deepEqual(pngSize(TINY_PNG), { width: 2, height: 1 });
     assert.throws(() => pngSize(Buffer.from("<html>not a png</html>")), /not a PNG/);
+  });
+});
+
+describe("UnixTransport.watchState", () => {
+  test("frames stream until unsubscribe, and the stream goes quiet on close", async () => {
+    const t = new UnixTransport(paths, 500);
+    const frames: RobotState[] = [];
+    let seen!: () => void;
+    const two = new Promise<void>((r) => (seen = r));
+    const off = t.watchState!((f) => {
+      frames.push(f);
+      if (frames.length >= 2) seen();
+    });
+    await two; // the fake daemon acks then sends two frames immediately —
+    // frames only flow on a robot.subscribe stream, so delivery proves it
+    off();
+    const before = frames.length;
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(frames.length, before, "unsubscribed stream delivers nothing");
+    assert.equal(frames[0].policy, "stand", "robot.state params arrive as frames");
   });
 });
 
