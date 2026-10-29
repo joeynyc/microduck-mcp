@@ -637,7 +637,9 @@ def main():
         "DUCK_SIM_SCENE", str(here / "vendor/microduck_rl/src/mjlab_microduck/robot/microduck/scene.xml")))
     ap.add_argument("--policies", default=os.environ.get("DUCK_SIM_POLICIES", str(here / "vendor/microduck/policies")))
     ap.add_argument("--battery-v", type=float, default=float(os.environ.get("DUCK_SIM_BATTERY_V", "7.9")))
-    ap.add_argument("--deadman-s", type=float, default=float(os.environ.get("DUCK_SIM_DEADMAN_S", "2.0")))
+    # robotd's safety.deadman_ms default (500). Looser here, a walk() whose
+    # resends slipped would still pass in sim and only stall on the robot.
+    ap.add_argument("--deadman-s", type=float, default=float(os.environ.get("DUCK_SIM_DEADMAN_S", "0.5")))
     ap.add_argument("--no-realtime", action="store_true", help="run as fast as possible (tests)")
     ap.add_argument("--record", default=os.environ.get("DUCK_SIM_RECORD"), help="capture <path>.rgb/.times continuously")
     ap.add_argument("--record-fps", type=float, default=float(os.environ.get("DUCK_SIM_RECORD_FPS", "30")))

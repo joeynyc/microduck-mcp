@@ -49,6 +49,18 @@ export async function preBehaviorCheck(t: DuckTransport, name: Behavior): Promis
 let lastMotionAt = 0;
 /** Bumped by stopWalk(); an in-flight walk() ends when it changes. */
 let walkEpoch = 0;
+/** The walk's robot.move that is on the wire right now, if any. */
+let inFlightIntent: Promise<unknown> | undefined;
+
+function sendIntent(t: DuckTransport, v: Twist): Promise<unknown> {
+  const p = t.call(M.robotMove, v);
+  inFlightIntent = p;
+  const clear = () => {
+    if (inFlightIntent === p) inFlightIntent = undefined;
+  };
+  p.then(clear, clear);
+  return p;
+}
 
 /** Clear the motion cooldown. Intended for tests; never call from a tool. */
 export function resetMotionCooldown(): void {
@@ -144,7 +156,7 @@ export async function walk(
   let interrupted = false;
   let result: unknown;
   try {
-    result = await t.call(M.robotMove, v);
+    result = await sendIntent(t, v);
     const until = started + durationS * 1000;
     for (let next = started + intervalMs; next < until && !held; next += intervalMs) {
       await sleep(next - Date.now());
@@ -153,12 +165,18 @@ export async function walk(
         break;
       }
       if (held) break;
-      await t.call(M.robotMove, v);
+      await sendIntent(t, v);
     }
     if (!interrupted && !held) {
       await sleep(until - Date.now());
       if (walkEpoch !== epoch) interrupted = true;
     }
+  } catch (e) {
+    // A refused or timed-out intent ends the walk. robotd's deadman would
+    // zero it within 500 ms anyway; say it explicitly, best effort. Not after
+    // stopWalk(): duck_stop owns that stop.
+    if (walkEpoch === epoch) await t.call(M.robotStop).catch(() => {});
+    throw e;
   } finally {
     walking = false;
     wake();
@@ -175,9 +193,30 @@ export async function walk(
   };
 }
 
-/** End any in-flight walk() loop. duck_stop calls this before robot.stop. */
-export function stopWalk(): void {
+/**
+ * End any in-flight walk() loop. Returns the intent it still has on the
+ * wire, if any (see stopMotion).
+ */
+export function stopWalk(): Promise<unknown> | undefined {
   walkEpoch++;
+  return inFlightIntent;
+}
+
+/**
+ * What duck_stop does: end the walk loop and zero motion now. A robot.move
+ * already on the wire can still reach robotd after this robot.stop — the unix
+ * and ssh transports open a connection per call, so nothing orders the two —
+ * and it would walk the duck again until the deadman. So once that intent has
+ * been answered, the stop is sent a second time. The first stop never waits.
+ */
+export async function stopMotion(t: DuckTransport): Promise<unknown> {
+  const inFlight = stopWalk();
+  const result = await t.call(M.robotStop);
+  if (inFlight) {
+    await inFlight.catch(() => {});
+    await t.call(M.robotStop);
+  }
+  return result;
 }
 
 /**
@@ -196,6 +235,20 @@ export async function preMotionCheck(
       `Rate limited: wait ${LIMITS.motionCooldownMs}ms between motion commands.`,
     );
   }
+  // Take the slot before the round trips below: two calls issued in parallel
+  // (clients do batch tool calls) would otherwise both pass the check above
+  // and both reach the robot. A refusal hands the slot back.
+  const previous = lastMotionAt;
+  lastMotionAt = now;
+  try {
+    await motionAllowed(t, opts);
+  } catch (e) {
+    if (lastMotionAt === now) lastMotionAt = previous;
+    throw e;
+  }
+}
+
+async function motionAllowed(t: DuckTransport, opts: { allowUnhealthy?: boolean }): Promise<void> {
   const health = (await t.call(M.robotHealth)) as HealthResult;
   const pct = health?.battery?.percent;
   if (typeof pct === "number" && pct / 100 < LIMITS.minBatteryForMotion) {
@@ -222,7 +275,6 @@ export async function preMotionCheck(
         `Wait until it is set down before commanding motion.`,
     );
   }
-  lastMotionAt = now;
 }
 
 /**

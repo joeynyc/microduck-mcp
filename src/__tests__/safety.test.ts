@@ -9,6 +9,7 @@ import {
   preBehaviorCheck,
   preMotionCheck,
   resetMotionCooldown,
+  stopMotion,
   stopWalk,
   walk,
 } from "../safety.js";
@@ -121,6 +122,18 @@ describe("preMotionCheck", () => {
     await preMotionCheck(t);
     await new Promise((r) => setTimeout(r, LIMITS.motionCooldownMs + 20));
     await preMotionCheck(t);
+  });
+
+  test("parallel motion commands: only one gets through", async () => {
+    // Both would pass a check-then-await-then-set cooldown; the slot is taken
+    // before the health round trip.
+    const t = stub(OK);
+    const results = await Promise.allSettled([preMotionCheck(t), preMotionCheck(t)]);
+    assert.deepEqual(
+      results.map((r) => r.status),
+      ["fulfilled", "rejected"],
+    );
+    assert.match(String((results[1] as PromiseRejectedResult).reason), /Rate limited/);
   });
 
   test("propagates transport errors (unreachable robot => no motion)", async () => {
@@ -340,6 +353,68 @@ describe("walk", () => {
       async close() {},
     };
     await assert.rejects(() => walk(t, { vx: 0.1, vy: 0, vyaw: 0 }, 1), /fallen/);
+  });
+
+  test("a failed resend ends the walk with an explicit robot.stop", async () => {
+    const calls: string[] = [];
+    let moves = 0;
+    const t: DuckTransport = {
+      async call(method: string) {
+        calls.push(method);
+        if (method === "robot.move" && ++moves === 2) throw new Error("timed out");
+        return {};
+      },
+      async state() {
+        throw new Error("no frames in this test");
+      },
+      async ping() {
+        return true;
+      },
+      async close() {},
+    };
+    await assert.rejects(() => walk(t, { vx: 0.1, vy: 0, vyaw: 0 }, 1, 20), /timed out/);
+    assert.equal(calls.at(-1), "robot.stop");
+  });
+});
+
+describe("stopMotion", () => {
+  /** robot.move takes `moveMs` to answer; every send and answer is recorded in order. */
+  function slowMoves(moveMs: number) {
+    const events: string[] = [];
+    const t: DuckTransport = {
+      async call(method: string) {
+        if (method === "robot.move") {
+          events.push("move>");
+          await new Promise((r) => setTimeout(r, moveMs));
+          events.push("<move");
+        } else events.push(method);
+        return {};
+      },
+      async state() {
+        throw new Error("no frames in this test");
+      },
+      async ping() {
+        return true;
+      },
+      async close() {},
+    };
+    return { t, events };
+  }
+
+  test("stops at once, and again after an intent that was still on the wire", async () => {
+    const { t, events } = slowMoves(60);
+    // walk() puts its first intent on the wire before it first yields.
+    const w = walk(t, { vx: 0.1, vy: 0, vyaw: 0 }, 5, 20);
+    await stopMotion(t);
+    await w;
+    // The first stop does not wait for the intent; the last word is a stop.
+    assert.deepEqual(events, ["move>", "robot.stop", "<move", "robot.stop"]);
+  });
+
+  test("one stop when no walk is in flight", async () => {
+    const { t, events } = slowMoves(0);
+    await stopMotion(t);
+    assert.deepEqual(events, ["robot.stop"]);
   });
 });
 

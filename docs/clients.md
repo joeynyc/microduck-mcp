@@ -201,6 +201,12 @@ on each tool call, consider pre-approving `duck_stop`, so that stopping the
 duck never waits on a click. In Claude Code, for example, add
 `"mcp__microduck__duck_stop"` to `permissions.allow` in your settings.
 
+Every tool carries MCP annotations: the seven read-only tools say
+`readOnlyHint: true`, so a client that honours annotations can skip approval
+for them and still ask before anything moves the duck or changes a policy slot.
+The annotations are hints for the client; the limits above are enforced by the
+server regardless.
+
 ## Troubleshooting
 
 - **Run it by hand.** `DUCK_TRANSPORT=sim npx -y microduck-mcp` should print

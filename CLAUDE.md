@@ -191,8 +191,9 @@ note saying so.
 - [ ] ChatGPT: it only connects to remote HTTPS MCP servers, so it needs a
       streamable-HTTP mode for this server + a tunnel. Codex CLI is the OpenAI
       path until then.
-- [ ] Tool annotations (`readOnlyHint` etc.) so approval-prompting clients can
-      auto-approve the read-only tools and prompt only for motion
+- [x] Tool annotations — required by `tool()` in `index.ts`: `READ_ONLY` for
+      the read tools, `MOTION` for walk/behavior, policy load/reset marked
+      destructive (they rewrite config; reset is the undo)
 
 ## Dev loop
 
@@ -201,7 +202,8 @@ note saying so.
   client (the "health, walk, quack" conversation, scripted). With
   `DUCK_TRANSPORT=sim` it also grabs camera frames into `demo-out/`.
 - `npm run setup-sim` once, then `DUCK_TRANSPORT=sim npm start`. Sidecar tuning
-  via `DUCK_SIM_BATTERY_V` (test the battery floor), `DUCK_SIM_DEADMAN_S`,
+  via `DUCK_SIM_BATTERY_V` (test the battery floor), `DUCK_SIM_DEADMAN_S`
+  (default 0.5 = robotd's, so a resend regression stalls the sim too),
   `DUCK_SIM_ARGS="--no-realtime"`.
 - Tests use `resetMotionCooldown()` from `src/safety.ts` to clear module
   state between cases; never call it from a tool.
@@ -221,8 +223,12 @@ note saying so.
   apply); the tool enum derives from that table — add behaviors there.
 - `duck_walk` is transport-independent: `walk()` in `safety.ts` re-sends
   `robot.move` every 200 ms (on a fixed grid, under the 500 ms deadman) for `duration_s` then sends `robot.stop`, because
-  upstream's intents are deadman-stamped. `duck_stop` interrupts it via
-  `stopWalk()`.
+  upstream's intents are deadman-stamped. `duck_stop` calls `stopMotion()`:
+  it ends the loop and sends `robot.stop` at once, then again once a
+  `robot.move` still on the wire has been answered (per-call connections
+  don't order the two). A failed resend also ends with `robot.stop`. The
+  rate-limit slot is taken before the health round trip, so parallel motion
+  calls can't both pass.
 - Never spell a wire method inline — import `M` from `transport/protocol.ts`.
   `DuckTransport.call(method, params)` routes to the daemon by the method's
   namespace (`serviceFor` in `types.ts`); there is no service argument.
