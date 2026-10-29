@@ -110,6 +110,9 @@ FALLEN_TICKS = 10
 CAM_W = (64, 640)
 CAM_H = (48, 480)
 MAX_RENDERERS = 2
+# Camera jobs pending on the render worker; a bound keeps a pathological
+# caller from queueing unbounded MjData snapshots.
+MAX_PENDING_RENDERS = 8
 
 POLICY_FILES = {
     "walk": "alpha_walking.onnx",
@@ -202,7 +205,7 @@ class DuckSim:
 
         self.battery_v = battery_v
         self.deadman_s = deadman_s
-        self.renderers: OrderedDict[tuple[int, int], object] = OrderedDict()
+        self.render_worker: RenderWorker | None = None
         self.t0 = time.monotonic()
         self.recorder: Recorder | None = None
         self.reset()
@@ -242,6 +245,15 @@ class DuckSim:
         self.missed = 0
         self.hz_est = 1.0 / CONTROL_DT
         self.tick_times: deque[float] = deque()
+        # Loop-timing diagnostics for `sim.stats` (harness use). main()
+        # updates them once per tick; stats() reports and re-arms them, so
+        # each call's window covers the ticks since the previous call.
+        self.stat_gap_max = 0.0
+        self.stat_hz_min = math.inf
+        self.stat_missed0 = 0
+        self.stat_serve_max = 0.0
+        self.stat_work_max = 0.0
+        self.stat_over_max = 0.0
 
     def _set_gain(self, ratio: float):
         if ratio == self.gain_ratio:
@@ -511,9 +523,126 @@ class DuckSim:
         self.reset()
         return {"reset": True, "sim": True}
 
-    def render(self, view: str, w: int, h: int, distance: float = 0.8) -> np.ndarray:
-        """One RGB frame. Runs on the loop thread (the GL context lives here):
-        a frame costs roughly half a tick, so a camera call may bump `missed`."""
+    def _render_worker(self) -> "RenderWorker":
+        """The thread that owns the GL context and every Renderer. Started on
+        first use: a parity/test driver that never asks for a frame never
+        pays for the thread."""
+        if self.render_worker is None:
+            self.render_worker = RenderWorker(self.model)
+        return self.render_worker
+
+    def submit_camera(self, p: dict, reply, err):
+        """sim.camera: enqueue a frame and answer asynchronously. The loop
+        thread only validates params and copies MjData (~0.1 ms); the ~50 ms
+        render happens on the worker, so a camera call can no longer push a
+        tick past its deadline (robotd's mediad renders off the loop too).
+        The snapshot is the state at request time — never a stale frame."""
+        w = int(clamp(int(p.get("width", 320)), *CAM_W))
+        h = int(clamp(int(p.get("height", 240)), *CAM_H))
+        view = str(p.get("view", "follow"))
+        distance = float(p.get("distance", 0.8))
+        # Validate the view now so a bad request is refused synchronously,
+        # the same as before renders went async.
+        if view != "head" and view not in ("follow", "front", "side", "top"):
+            raise RpcError(-32602, f"unknown view {view!r}; use head|follow|front|side|top")
+        snap = self._render_worker().take_snapshot(self.data)
+        t = round(self.now(), 3)
+
+        def finish(img: np.ndarray):
+            from PIL import Image
+            buf = io.BytesIO()
+            Image.fromarray(img).save(buf, format="PNG")
+            reply({"png_base64": base64.b64encode(buf.getvalue()).decode("ascii"),
+                    "width": w, "height": h, "view": view, "t": t, "sim": True})
+
+        self._render_worker().submit(snap, view, w, h, distance, finish, err)
+
+    def system_info(self, _p: dict) -> dict:
+        return {"name": "simduck", "serial": None, "uptime_seconds": int(self.now()), "sim": True}
+
+    def list_installed(self, p: dict) -> dict:
+        return [{"version": "0.0.0-sim", "active": True, "golden": True, "component": p.get("component", "daemon")}]
+
+    def stats(self, _p: dict) -> dict:
+        """sim.stats: loop-timing diagnostics since the previous call (the
+        harness's stall probe). The gap is between consecutive tick ends;
+        a stall in request handling — a render is roughly half a tick —
+        shows up as the gap over the tick that followed it."""
+        out = {
+            "max_tick_gap_ms": round(self.stat_gap_max * 1000.0, 3),
+            "loop_hz_min": round(self.stat_hz_min, 2) if math.isfinite(self.stat_hz_min) else None,
+            "missed_ticks": self.missed - self.stat_missed0,
+            # Worst wall time per phase, to say where the gap came from.
+            "max_serve_ms": round(self.stat_serve_max * 1000.0, 3),
+            "max_tick_work_ms": round(self.stat_work_max * 1000.0, 3),
+            "max_sleep_overshoot_ms": round(self.stat_over_max * 1000.0, 3),
+            "loop": {"hz": round(self.hz_est, 1), "missed": self.missed},
+        }
+        self.stat_gap_max = 0.0
+        self.stat_hz_min = math.inf
+        self.stat_missed0 = self.missed
+        self.stat_serve_max = 0.0
+        self.stat_work_max = 0.0
+        self.stat_over_max = 0.0
+        return out
+
+
+class RenderWorker:
+    """One daemon thread owning the GL context and every Renderer. The loop
+    thread hands it an `MjData` snapshot per request (mj_copyData, ~0.1 ms);
+    the ~50 ms render and the PNG encode no longer sit between ticks.
+    `finish`/`err` callbacks run on this thread — keep them to I/O."""
+
+    def __init__(self, model):
+        import mujoco
+        self.mujoco = mujoco
+        self.model = model
+        self.trunk = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "trunk_base")
+        self.head_cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "head_camera")
+        self.renderers: OrderedDict[tuple[int, int], object] = OrderedDict()
+        self.jobs: queue.Queue = queue.Queue()
+        self.snaps: queue.Queue = queue.Queue()  # recycled MjData snapshots
+        self.pending = 0
+        self.pending_lock = threading.Lock()
+        threading.Thread(target=self._run, daemon=True, name="duck-render").start()
+
+    def take_snapshot(self, data):
+        """An MjData holding a copy of `data`, from the recycle pool when one
+        is free. Called on the requester's thread — the copy must see a
+        quiescent `data`, which is the loop thread between ticks."""
+        try:
+            snap = self.snaps.get_nowait()
+        except queue.Empty:
+            snap = self.mujoco.MjData(self.model)
+        self.mujoco.mj_copyData(snap, self.model, data)
+        return snap
+
+    def submit(self, snap, view: str, w: int, h: int, distance: float, finish, err):
+        with self.pending_lock:
+            if self.pending >= MAX_PENDING_RENDERS:
+                self.snaps.put(snap)  # refused job returns its snapshot to the pool
+                raise RpcError(-32000, f"camera busy: {MAX_PENDING_RENDERS} frames already queued")
+            self.pending += 1
+        self.jobs.put((snap, view, w, h, distance, finish, err))
+
+    def _run(self):
+        while True:
+            snap, view, w, h, distance, finish, err = self.jobs.get()
+            try:
+                finish(self.render(snap, view, w, h, distance))
+            except Exception as e:  # noqa: BLE001 — a dead job must not kill the worker
+                try:
+                    err(e)
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                self.snaps.put(snap)
+                with self.pending_lock:
+                    self.pending -= 1
+
+    def render(self, data, view: str, w: int, h: int, distance: float) -> np.ndarray:
+        """One RGB frame from an MjData snapshot. Same camera math the loop
+        thread used to run — moved, not changed."""
         mujoco = self.mujoco
         cam = mujoco.MjvCamera()
         cam.type = mujoco.mjtCamera.mjCAMERA_FREE
@@ -523,8 +652,8 @@ class DuckSim:
             # renders from it. So take its world pose, look along +z (the lens
             # direction: forward and ~14° down, the pickup view), start 5 cm out
             # so the shell isn't in frame, and keep its field of view.
-            d = self.data.cam_xmat[self.head_cam].reshape(3, 3)[:, 2]
-            eye = self.data.cam_xpos[self.head_cam] + 0.05 * d
+            d = data.cam_xmat[self.head_cam].reshape(3, 3)[:, 2]
+            eye = data.cam_xpos[self.head_cam] + 0.05 * d
             cam.lookat[:] = eye + d
             cam.distance = 1.0
             cam.azimuth = math.degrees(math.atan2(d[1], d[0]))
@@ -533,11 +662,9 @@ class DuckSim:
         else:
             # Free camera sits at lookat − distance·forward(az, el), so
             # azimuth == robot yaw puts it behind the robot, looking forward.
-            yaw = math.degrees(quat_yaw(self.data.xquat[self.trunk]))
+            yaw = math.degrees(quat_yaw(data.xquat[self.trunk]))
             presets = {"follow": (yaw, -20), "front": (yaw + 180, -10), "side": (yaw + 90, -10), "top": (yaw, -89)}
-            if view not in presets:
-                raise RpcError(-32602, f"unknown view {view!r}; use head|follow|front|side|top")
-            cam.lookat[:] = self.data.xpos[self.trunk]
+            cam.lookat[:] = data.xpos[self.trunk]
             cam.distance = distance
             cam.azimuth, cam.elevation = presets[view]
             fovy = float(self.model.vis.global_.fovy)
@@ -552,27 +679,22 @@ class DuckSim:
         saved = self.model.vis.global_.fovy
         self.model.vis.global_.fovy = fovy
         try:
-            r.update_scene(self.data, camera=cam)
+            r.update_scene(data, camera=cam)
         finally:
             self.model.vis.global_.fovy = saved
         return r.render()
 
-    def camera(self, p: dict) -> dict:
-        from PIL import Image
-        w = int(clamp(int(p.get("width", 320)), *CAM_W))
-        h = int(clamp(int(p.get("height", 240)), *CAM_H))
-        view = str(p.get("view", "follow"))
-        img = self.render(view, w, h, float(p.get("distance", 0.8)))
-        buf = io.BytesIO()
-        Image.fromarray(img).save(buf, format="PNG")
-        return {"png_base64": base64.b64encode(buf.getvalue()).decode("ascii"),
-                "width": w, "height": h, "view": view, "t": round(self.now(), 3), "sim": True}
-
-    def system_info(self, _p: dict) -> dict:
-        return {"name": "simduck", "serial": None, "uptime_seconds": int(self.now()), "sim": True}
-
-    def list_installed(self, p: dict) -> dict:
-        return [{"version": "0.0.0-sim", "active": True, "golden": True, "component": p.get("component", "daemon")}]
+    def warmup(self, view: str, w: int, h: int, data):
+        """Render-and-discard one frame, blocking the caller until it is done
+        — startup use only, so the renderer is built before `sim.ready`."""
+        done = threading.Event()
+        box = []
+        self.submit(self.take_snapshot(data), view, w, h, 0.8,
+                    lambda _img: (box.append(True), done.set()),
+                    lambda e: (box.append(e), done.set()))
+        done.wait()
+        if box and isinstance(box[0], Exception):
+            raise box[0]
 
 
 class Recorder:
@@ -589,6 +711,11 @@ class Recorder:
         self.times = open(self.dir / "times.txt", "w")
         self.next_at = time.time()
         self.frames = 0
+        # At most one recorder frame on the worker at a time: at 30 fps the
+        # recorder alone would fill the render queue and starve sim.camera
+        # ("camera busy"). A frame that would queue behind it is dropped;
+        # times.txt has one line per frame written, so a compositor still syncs.
+        self.busy = False
 
     def maybe_capture(self, sim: DuckSim):
         from PIL import Image
@@ -597,10 +724,27 @@ class Recorder:
             return
         # Catch up to the wall clock but never render more than one frame per tick.
         self.next_at = max(self.next_at + 1.0 / self.fps, now - 1.0 / self.fps)
-        Image.fromarray(sim.render(self.view, self.w, self.h, self.distance)).save(
-            self.dir / f"{self.frames:06d}.jpg", quality=90)
-        self.times.write(f"{now:.4f}\n")
-        self.times.flush()
+        if self.busy:
+            return
+        snap = sim._render_worker().take_snapshot(sim.data)
+        n = self.frames
+
+        def save(img: np.ndarray):
+            Image.fromarray(img).save(self.dir / f"{n:06d}.jpg", quality=90)
+            self.times.write(f"{now:.4f}\n")
+            self.times.flush()
+            self.busy = False
+
+        def failed(_e):
+            self.busy = False
+
+        # Set before submit: the worker can finish (and clear it) first.
+        self.busy = True
+        try:
+            sim._render_worker().submit(snap, self.view, self.w, self.h, self.distance, save, failed)
+        except RpcError:
+            self.busy = False
+            return  # render queue full: drop the frame rather than stall the loop
         self.frames += 1
 
     def close(self):
@@ -609,6 +753,8 @@ class Recorder:
 
 # Wire methods → handlers. Names are upstream's (duck-ipc-proto/src/lib.rs);
 # `robot.state` as a *request* and `sim.*` are sidecar extensions.
+# `sim.camera` is not here: it answers asynchronously from the render
+# worker, so serve() routes it to submit_camera() directly.
 METHODS = {
     "robot.health": DuckSim.health,
     "robot.subscribe": DuckSim.subscribe,
@@ -621,7 +767,7 @@ METHODS = {
     "robot.sound": DuckSim.sound,
     "system.info": DuckSim.system_info,
     "update.listInstalled": DuckSim.list_installed,
-    "sim.camera": DuckSim.camera,
+    "sim.stats": DuckSim.stats,
     "sim.reset": DuckSim.sim_reset,
 }
 
@@ -662,9 +808,10 @@ def main():
     t = time.time()
     sim = DuckSim(scene, policies, args.battery_v, args.deadman_s)
     # Build the default duck_camera renderer now. Creating one is a GL setup
-    # of ~a quarter second on the loop thread; done on the first camera call,
-    # it would stall the policy mid-walk (12 missed ticks, measured).
-    sim.render("head", 320, 240)
+    # of ~a second; done on the first camera call it would stall the policy
+    # mid-walk (12 missed ticks, measured). It blocks on the worker, so the
+    # context belongs to the thread that will use it.
+    sim._render_worker().warmup("head", 320, 240, sim.data)
     if args.record:
         w, h = (int(x) for x in args.record_size.lower().split("x"))
         sim.recorder = Recorder(args.record, args.record_fps, args.record_view, w, h, args.record_distance)
@@ -689,6 +836,20 @@ def main():
             return
         rid, method = req.get("id"), str(req.get("method"))
         try:
+            if method == "sim.camera":
+                # Async: the worker renders, then sends the reply itself.
+                # Validation errors still answer synchronously below; a
+                # request without an id is a notification — render, reply
+                # to nobody, exactly as before.
+                if rid is not None:
+                    reply = lambda result: send({"jsonrpc": "2.0", "id": rid, "result": result})
+                    err = lambda e: send({"jsonrpc": "2.0", "id": rid, "error":
+                                          {"code": e.code if isinstance(e, RpcError) else -32000,
+                                           "message": e.message if isinstance(e, RpcError) else f"{type(e).__name__}: {e}"}})
+                else:
+                    reply = err = lambda _x: None
+                sim.submit_camera(req.get("params") or {}, reply, err)
+                return
             handler = METHODS.get(method)
             if handler is None:
                 raise RpcError(-32601, f"method not found: {method}")
@@ -702,40 +863,67 @@ def main():
             if rid is not None:
                 send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": f"{type(e).__name__}: {e}"}})
 
+    def handle(line) -> bool:
+        """Serve one inbox line; False once stdin has closed."""
+        if line is None:
+            if sim.recorder:
+                sim.recorder.close()
+            return False
+        serve(line)
+        return True
+
     next_tick = time.monotonic()
     while True:
-        # Service requests between ticks, on the loop thread (rendering needs it).
+        # Service requests between ticks, on the loop thread.
+        phase0 = time.monotonic()
         while True:
             try:
                 line = inbox.get_nowait()
             except queue.Empty:
                 break
-            if line is None:
-                if sim.recorder:
-                    sim.recorder.close()
+            if not handle(line):
                 return
-            serve(line)
+        sim.stat_serve_max = max(sim.stat_serve_max, time.monotonic() - phase0)
 
+        phase0 = time.monotonic()
         sim.tick()
         if sim.recorder:
             sim.recorder.maybe_capture(sim)
+        sim.stat_work_max = max(sim.stat_work_max, time.monotonic() - phase0)
         now = time.monotonic()
         # The achieved rate over the last second of wall time, as robotd's
         # loop.hz means it. Not 1/(this tick's interval): a loop that fell
         # behind (a camera frame costs about half a tick) catches up with
         # ticks back to back, each of which alone reads as ~500 Hz.
+        prev_tick = sim.tick_times[-1] if sim.tick_times else None
         sim.tick_times.append(now)
         while now - sim.tick_times[0] > 1.0:
             sim.tick_times.popleft()
         if now - sim.tick_times[0] >= 0.5:
             sim.hz_est = (len(sim.tick_times) - 1) / (now - sim.tick_times[0])
+            sim.stat_hz_min = min(sim.stat_hz_min, sim.hz_est)
+        if prev_tick is not None:
+            sim.stat_gap_max = max(sim.stat_gap_max, now - prev_tick)
         if args.no_realtime:
             sim.hz_est = 1.0 / CONTROL_DT
             continue
         next_tick += CONTROL_DT
         delay = next_tick - now
         if delay > 0:
-            time.sleep(delay)
+            # Wait for the next tick on the inbox, not in sleep(): a request
+            # that lands mid-wait is served now rather than at the next tick.
+            # A serve is well under a millisecond now that camera frames
+            # render on the worker.
+            while (remain := next_tick - time.monotonic()) > 0:
+                try:
+                    line = inbox.get(timeout=remain)
+                except queue.Empty:
+                    break
+                phase0 = time.monotonic()
+                if not handle(line):
+                    return
+                sim.stat_serve_max = max(sim.stat_serve_max, time.monotonic() - phase0)
+            sim.stat_over_max = max(sim.stat_over_max, time.monotonic() - next_tick)
         elif delay < -CONTROL_DT:
             sim.missed += 1
             next_tick = now
