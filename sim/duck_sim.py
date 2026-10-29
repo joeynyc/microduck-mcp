@@ -190,11 +190,19 @@ class DuckSim:
         self.gain_ratio = -1.0
 
         # All nets load eagerly: a first-use load mid-skill would stall the loop.
+        # One thread, sequential nodes: these are small MLPs, and per-session
+        # thread pools cost more to spin up (~140 ms across seven sessions)
+        # and to hand work to than the matmuls themselves. Same kernels in
+        # the same order, so outputs are bit-identical (bench/parity.py).
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = 1
+        so.inter_op_num_threads = 1
+        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         self.nets: dict[str, ort.InferenceSession] = {}
         for role, fname in POLICY_FILES.items():
             p = policy_dir / fname
             if p.exists():
-                s = ort.InferenceSession(str(p), providers=["CPUExecutionProvider"])
+                s = ort.InferenceSession(str(p), sess_options=so, providers=["CPUExecutionProvider"])
                 i, o = s.get_inputs()[0], s.get_outputs()[0]
                 if list(i.shape) != [1, OBS_LEN] or list(o.shape) != [1, ACTION_LEN]:
                     raise RuntimeError(f"{fname}: expected obs[1,{OBS_LEN}]→actions[1,{ACTION_LEN}], got {i.shape}→{o.shape}")
@@ -312,8 +320,7 @@ class DuckSim:
             self.target_twist[:] = 0.0
             self.kick = self.roulade = self.ground_pick = None
         if self.fallen:
-            for _ in range(DECIMATION):
-                self.mujoco.mj_step(self.model, self.data)
+            self.mujoco.mj_step(self.model, self.data, DECIMATION)
             self.label, self.mode = "limp", "fallen"
             return
 
@@ -371,8 +378,7 @@ class DuckSim:
 
         self._set_gain(gain)
         self.data.ctrl[:] = targets
-        for _ in range(DECIMATION):
-            self.mujoco.mj_step(self.model, self.data)
+        self.mujoco.mj_step(self.model, self.data, DECIMATION)
 
         # Advance windows after the tick that used them.
         if self.ground_pick is not None:
@@ -809,10 +815,11 @@ def main():
 
     t = time.time()
     sim = DuckSim(scene, policies, args.battery_v, args.deadman_s)
-    # Build the default duck_camera renderer now. Creating one is a GL setup
-    # of ~a second; done on the first camera call it would stall the policy
-    # mid-walk (12 missed ticks, measured). It blocks on the worker, so the
-    # context belongs to the thread that will use it.
+    # Build the default duck_camera renderer now, on the worker that owns the
+    # GL context, and wait for it. Not overlapped with the loop: building the
+    # GL context holds the GIL for ~0.55 s, and a walk started meanwhile
+    # stalled the loop that long (measured: 578 ms tick gap), past the
+    # 0.5 s deadman. Done on the first camera call it would stall mid-walk.
     sim._render_worker().warmup("head", 320, 240, sim.data)
     if args.record:
         w, h = (int(x) for x in args.record_size.lower().split("x"))
