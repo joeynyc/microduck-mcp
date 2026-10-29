@@ -218,6 +218,12 @@ note saying so.
   fixed command script on a tick-count clock, sha256 of every tick's
   qpos+qvel+action vs `bench/parity-hash.txt`) then the camera-during-walk
   timing bench. Any sim refactor that changes the hash changed behaviour.
+- `node bench/cold-start.mjs` — SimTransport construction → first
+  `robot.health` and first frame, median of 5. The ONNX sessions run
+  single-threaded on purpose (default per-session pools cost ~1 s of
+  startup and ~4× tick time on a many-core box; outputs are bit-identical).
+  `sim.ready` waits for the GL context on purpose: built beside a running
+  loop it holds the GIL ~0.55 s and stalls a walk past the deadman.
 
 ## Conventions
 
