@@ -1,4 +1,4 @@
-import { test, describe, beforeEach } from "node:test";
+import { test, describe, beforeEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import {
   BEHAVIOR_NAMES,
@@ -253,6 +253,25 @@ describe("walk", () => {
     assert.equal(r.interrupted, true);
     assert.ok(!t.calls.includes("robot.stop"), "duck_stop sends robot.stop itself");
     assert.ok(t.calls.length < 10, "did not keep walking after stopWalk");
+  });
+
+  test("a wall-clock step neither cuts the walk short nor bursts intents", async () => {
+    // NTP / WSL2 resyncs step Date.now(); the grid must not follow it. The
+    // clock steps 2 s forward right after the walk reads its start time.
+    const realNow = Date.now.bind(Date);
+    let reads = 0;
+    const step = mock.method(Date, "now", () => realNow() + (reads++ > 0 ? 2000 : 0));
+    try {
+      const t = stub(OK);
+      const began = performance.now();
+      await walk(t, { vx: 0.1, vy: 0, vyaw: 0 }, 0.3, 50);
+      const took = performance.now() - began;
+      const intents = t.calls.filter((c) => c === "robot.move").length;
+      assert.ok(took >= 280, `walk lasted ${took.toFixed(0)} ms of 300`);
+      assert.ok(intents >= 5 && intents <= 7, `expected ~6 intents, got ${intents}`);
+    } finally {
+      step.mock.restore();
+    }
   });
 
   test("re-sends on a fixed grid, so a slow round trip does not stretch the period", async () => {
