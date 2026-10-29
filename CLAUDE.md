@@ -141,12 +141,21 @@ note saying so.
   `setup-sim` and `sim-python …` (runs the sim venv's interpreter).
 - Speaks robotd's wire protocol over stdio, so `SimTransport` is
   `UnixTransport` with a child process where the socket is. Extra methods:
-  `sim.camera {view,width,height}` → base64 PNG, `sim.reset`.
+  `sim.camera {view,width,height}` → base64 PNG, `sim.reset`, `sim.stats`
+  (loop-timing diagnostics since the last call: max tick gap, min hz,
+  missed, worst serve/tick/overshoot — used by `bench/camera-stall.sh`).
 - `loop.hz` is the achieved rate over the last second of wall time (what
   robotd's means), not 1/(last tick interval): catch-up ticks after a stall
-  run back to back and read as ~500 Hz each. The default `duck_camera`
-  renderer (320×240) is built at startup; built on the first call it stalled
-  the policy ~0.25 s mid-walk.
+  run back to back and read as ~500 Hz each.
+- Camera frames render on a `RenderWorker` thread that owns the GL context:
+  the loop thread only copies `MjData` (`mj_copyData`, ~0.1 ms, pooled
+  snapshots) and moves on, and the worker answers `sim.camera` itself. A
+  frame shows the state at request time. Before this a render (~50 ms) ran
+  between ticks: 19 missed ticks and a 115 ms worst gap per 10 s walk at
+  2 Hz camera; now 0 and ~20.4 ms. At most 8 frames queue (`camera busy`
+  after that). The default 320×240 renderer is built on the worker before
+  `sim.ready`. While idle the loop waits on its inbox, so a request is
+  served when it lands rather than at the next tick.
 - **Known sim fidelity limit:** the reference scene's position actuators
   under-track small commands. Verified against upstream's own
   `infer_policy.py` (identical numbers, bit-identical obs): vx 0.2 → ~0
@@ -207,6 +216,10 @@ note saying so.
   `DUCK_SIM_ARGS="--no-realtime"`.
 - Tests use `resetMotionCooldown()` from `src/safety.ts` to clear module
   state between cases; never call it from a tool.
+- `bash bench/camera-stall.sh` — physics parity check (`bench/parity.py`:
+  fixed command script on a tick-count clock, sha256 of every tick's
+  qpos+qvel+action vs `bench/parity-hash.txt`) then the camera-during-walk
+  timing bench. Any sim refactor that changes the hash changed behaviour.
 
 ## Conventions
 
