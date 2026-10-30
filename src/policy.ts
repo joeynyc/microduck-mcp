@@ -112,11 +112,28 @@ function daemonTooOld(method: string, e: unknown): Error {
   return e instanceof Error ? e : new Error(msg);
 }
 
+/**
+ * Daemon 0.18+ refuses a community fetch until the owner sets `[policy]
+ * allow_community = true` (PERMISSION_DENIED, code 14, naming the key). The
+ * daemon's text is written for a person at a shell; an agent also needs to hear
+ * that flipping it is the owner's call, not a retry it should engineer.
+ */
+function communityOff(e: Error): Error {
+  if (!/code 14\)/.test(e.message) || !/allow_community/.test(e.message)) return e;
+  return new Error(
+    `This robot only fetches official (${OFFICIAL_HF_ORG}) policies: community ` +
+      `policies are off until its owner sets allow_community = true under [policy] ` +
+      `with \`sudo robotctl configure\` (no restart needed). That is the owner's ` +
+      `decision — ask them; do not change it yourself. Official policies still load. ` +
+      `(underlying: ${e.message})`,
+  );
+}
+
 async function callPolicyMethod(t: DuckTransport, method: string, params?: Record<string, unknown>): Promise<unknown> {
   try {
     return await t.call(method, params);
   } catch (e) {
-    throw daemonTooOld(method, e);
+    throw communityOff(daemonTooOld(method, e));
   }
 }
 

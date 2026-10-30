@@ -56,7 +56,9 @@ sessions on this repo.
    `LoadPolicyParams` is `deny_unknown_fields`: only `slot` and `path` ever go
    on the wire. Reset = same method, no path; reset-all = neither field, one
    call. An older daemon's METHOD_NOT_FOUND is translated into "your daemon is
-   too old". Origin (`pollen-robotics/*` official, any other HF repo community,
+   too old". Daemon 0.18+ refuses a community fetch until the owner sets
+   `[policy] allow_community = true` (PERMISSION_DENIED, code 14); we add that
+   flipping it is the owner's call, not the agent's (`communityOff`). Origin (`pollen-robotics/*` official, any other HF repo community,
    a path local) is decided by the daemon and reported back; our constant in
    `protocol.ts` is only for what we say before asking. `walk = "none"` is
    refused (by us first, by the daemon too). We do NOT read manifests
