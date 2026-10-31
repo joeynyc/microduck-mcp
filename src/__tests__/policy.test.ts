@@ -122,6 +122,26 @@ describe("loadPolicy", () => {
     assert.equal((await loadPolicy(t, "stand", "x/y")).origin, "official");
   });
 
+  test("a community refusal (daemon 0.18+, allow_community off) says it is the owner's call", async () => {
+    const refusal = new Error(
+      "nocrab/microduck-flamingo is a community policy, and this robot only fetches from pollen-robotics: " +
+        "set allow_community = true under [policy] with sudo robotctl configure (code 14)",
+    );
+    const t = stub({ "policy.fetch": refusal });
+    await assert.rejects(() => loadPolicy(t, "walk", "nocrab/microduck-flamingo"), (e: Error) => {
+      assert.match(e.message, /owner's decision/);
+      assert.match(e.message, /do not change it yourself/);
+      assert.match(e.message, /underlying: .*code 14/);
+      return true;
+    });
+    assert.equal(t.calls.length, 1, "nothing is loaded after a refused fetch");
+  });
+
+  test("other permission refusals pass through untouched", async () => {
+    const t = stub({ "policy.fetch": new Error("not allowed (code 14)") });
+    await assert.rejects(() => loadPolicy(t, "walk", "x/y"), /^Error: not allowed \(code 14\)$/);
+  });
+
   test("an absolute path skips the fetch and is loaded as-is", async () => {
     const t = stub();
     const r = await loadPolicy(t, "stand", "/home/radxa/p.onnx");

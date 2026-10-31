@@ -247,7 +247,9 @@ tool(
       "several .onnx files or the wrong shape), then swapped in live. " +
       `ORIGIN follows the HF org: '${OFFICIAL_HF_ORG}/*' is official, any other ` +
       "repo is community (unsigned, never auto-updated, never a reset target), " +
-      "and a path is local. source='none' switches a slot off — allowed for " +
+      "and a path is local. Daemon 0.18+ refuses community repos until the " +
+      "owner sets [policy] allow_community = true — that is theirs to change, " +
+      "not yours. source='none' switches a slot off — allowed for " +
       "every slot EXCEPT walk, which the others fall back to. The change is " +
       "written to the robot's config, so it SURVIVES A REBOOT: duck_policy_reset " +
       "is the undo. A load that fails to build keeps the policy that was " +
